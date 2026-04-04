@@ -4,17 +4,15 @@ using StaticArrays
 using SamplesCore: Stereo
 
 # ------------------------------------------------------------
-# Pass memory types
+# Pass memory types (algorithmic only, no layout)
 # ------------------------------------------------------------
 
 struct IntraPassMemoryGeneric{N,T}
     delta::Int
-    offset::Int
 end
 
 struct IntraPassMemorySpecial{N,T}
     delta::Int
-    offset::Int
 end
 
 struct IntraPassMemoryCrossChannel{term}
@@ -35,20 +33,21 @@ struct CrossPassState
 end
 
 # ------------------------------------------------------------
-# Intra-channel processing (using single MMatrix buffer)
+# Intra-channel processing (single MMatrix buffer + per-pass offset)
 # ------------------------------------------------------------
 
 @inline function process_pass!(
     mem::IntraPassMemoryGeneric{N,T},
     st::IntraPassState,
     buf::MMatrix{2,TOTAL,T},
+    offset::Int,
     s::Stereo{T},
 ) where {N,T,TOTAL}
 
     L = s.l
     R = s.r
 
-    bi = mem.offset + st.idx
+    bi = offset + st.idx
 
     dL = buf[1, bi]
     dR = buf[2, bi]
@@ -72,13 +71,14 @@ end
     mem::IntraPassMemorySpecial{N,T},
     st::IntraPassState,
     buf::MMatrix{2,TOTAL,T},
+    offset::Int,
     s::Stereo{T},
 ) where {N,T,TOTAL}
 
     L = s.l
     R = s.r
 
-    bi = mem.offset + st.idx
+    bi = offset + st.idx
 
     dL = buf[1, bi]
     dR = buf[2, bi]
@@ -136,11 +136,12 @@ end
     end
 end
 
-# unify arity for generated chain
+# unify arity for generated chain (ignore buf/offset)
 @inline process_pass!(
     mem::IntraPassMemoryCrossChannel{term},
     st::CrossPassState,
     buf::MMatrix{2,TOTAL,T},
+    offset::Int,
     s::Stereo{T},
 ) where {T,term,TOTAL} = process_pass!(mem, st, s)
 
@@ -153,23 +154,18 @@ function make_memories(::Type{T},
                        deltas::AbstractVector{Int}) where {T}
 
     mems = ()
-    offset = 0
-
     for (term, delta) in zip(terms, deltas)
         if 1 <= term <= 8
             N = term
-            mem = IntraPassMemoryGeneric{N,T}(delta, offset)
-            offset += N
+            mem = IntraPassMemoryGeneric{N,T}(delta)
 
         elseif term == 17
             N = 1
-            mem = IntraPassMemorySpecial{N,T}(delta, offset)
-            offset += N
+            mem = IntraPassMemorySpecial{N,T}(delta)
 
         elseif term == 18
             N = 2
-            mem = IntraPassMemorySpecial{N,T}(delta, offset)
-            offset += N
+            mem = IntraPassMemorySpecial{N,T}(delta)
 
         else
             mem = IntraPassMemoryCrossChannel{term}(delta)
@@ -195,19 +191,41 @@ function make_states(memories; init_weight=0)
 end
 
 # ------------------------------------------------------------
-# Generated, fully unrolled chain
+# Compute per-pass offsets + total buffer size
+# ------------------------------------------------------------
+
+function compute_offsets(memories)
+    offsets = ()
+    offset = 0
+    for mem in memories
+        if mem isa IntraPassMemoryGeneric{N,T} where {N,T}
+            offsets = (offsets..., offset)
+            offset += N
+        elseif mem isa IntraPassMemorySpecial{N,T} where {N,T}
+            offsets = (offsets..., offset)
+            offset += N
+        else
+            offsets = (offsets..., 0)  # cross-channel: unused
+        end
+    end
+    return offsets, max(offset, 1)
+end
+
+# ------------------------------------------------------------
+# Generated, fully unrolled chain (with offsets)
 # ------------------------------------------------------------
 
 @generated function process_chain!(
     memories::MT,
     states::ST,
+    offsets::OT,
     buf::MMatrix{2,TOTAL,T},
     s::Stereo{T},
-) where {N,MT<:NTuple{N,Any},ST<:NTuple{N,Any},TOTAL,T}
+) where {N,MT<:NTuple{N,Any},ST<:NTuple{N,Any},OT<:NTuple{N,Any},TOTAL,T}
 
     steps = Vector{Expr}(undef, N)
     for i in 1:N
-        steps[i] = :(s, st_$i = process_pass!(memories[$i], states[$i], buf, s))
+        steps[i] = :(s, st_$i = process_pass!(memories[$i], states[$i], buf, offsets[$i], s))
     end
 
     new_states = Expr(:tuple, [Symbol("st_$i") for i in 1:N]...)
@@ -219,22 +237,6 @@ end
 end
 
 # ------------------------------------------------------------
-# Buffer size helper
-# ------------------------------------------------------------
-
-function buffer_total(memories)
-    total = 0
-    for mem in memories
-        if mem isa IntraPassMemoryGeneric
-            total = max(total, mem.offset + mem.delta)
-        elseif mem isa IntraPassMemorySpecial
-            total = max(total, mem.offset + mem.delta)
-        end
-    end
-    return max(total, 1)
-end
-
-# ------------------------------------------------------------
 # Block processor on Vector{Stereo{T}}
 # ------------------------------------------------------------
 
@@ -243,13 +245,13 @@ function process_block!(data::AbstractVector{Stereo{T}},
                         init_weight=0) where {T}
 
     states = make_states(memories; init_weight)
-    TOTAL = buffer_total(memories)
+    offsets, TOTAL = compute_offsets(memories)
 
     buf = MMatrix{2,TOTAL,T}(zeros(T, 2, TOTAL))
 
     for i in eachindex(data)
         s = data[i]
-        s, states = process_chain!(memories, states, buf, s)
+        s, states = process_chain!(memories, states, offsets, buf, s)
         data[i] = s
     end
 
