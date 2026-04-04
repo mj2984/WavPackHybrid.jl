@@ -4,7 +4,7 @@ using StaticArrays
 using SamplesCore: Stereo
 
 # ------------------------------------------------------------
-# Pass memory types (algorithmic only, no layout)
+# Pass memory types
 # ------------------------------------------------------------
 
 struct IntraPassMemoryGeneric{N,T}
@@ -20,7 +20,7 @@ struct IntraPassMemoryCrossChannel{term}
 end
 
 # ------------------------------------------------------------
-# Immutable state types
+# Predictor state types
 # ------------------------------------------------------------
 
 struct IntraPassState
@@ -33,7 +33,7 @@ struct CrossPassState
 end
 
 # ------------------------------------------------------------
-# Intra-channel processing (single MMatrix buffer + per-pass offset)
+# Intra-channel decorrelation pass
 # ------------------------------------------------------------
 
 @inline function process_pass!(
@@ -48,7 +48,6 @@ end
     R = s.r
 
     bi = offset + st.idx
-
     dL = buf[1, bi]
     dR = buf[2, bi]
 
@@ -79,7 +78,6 @@ end
     R = s.r
 
     bi = offset + st.idx
-
     dL = buf[1, bi]
     dR = buf[2, bi]
 
@@ -99,7 +97,7 @@ end
 end
 
 # ------------------------------------------------------------
-# Cross-channel processing (no buffer use)
+# Cross-channel decorrelation pass
 # ------------------------------------------------------------
 
 @inline function process_pass!(
@@ -136,7 +134,7 @@ end
     end
 end
 
-# unify arity for generated chain (ignore buf/offset)
+# unify arity for generated chain
 @inline process_pass!(
     mem::IntraPassMemoryCrossChannel{term},
     st::CrossPassState,
@@ -146,28 +144,21 @@ end
 ) where {T,term,TOTAL} = process_pass!(mem, st, s)
 
 # ------------------------------------------------------------
-# Constructors for memories and states
+# Memory + state constructors
 # ------------------------------------------------------------
 
-function make_memories(::Type{T},
-                       terms::AbstractVector{Int},
-                       deltas::AbstractVector{Int}) where {T}
-
+function make_memories(::Type{T}, terms, deltas) where {T}
     mems = ()
     for (term, delta) in zip(terms, deltas)
-        if 1 <= term <= 8
-            N = term
-            mem = IntraPassMemoryGeneric{N,T}(delta)
+        if 1 ≤ term ≤ 8
+            mems = (mems..., IntraPassMemoryGeneric{term,T}(delta))
         elseif term == 17
-            N = 1
-            mem = IntraPassMemorySpecial{N,T}(delta)
+            mems = (mems..., IntraPassMemorySpecial{1,T}(delta))
         elseif term == 18
-            N = 2
-            mem = IntraPassMemorySpecial{N,T}(delta)
+            mems = (mems..., IntraPassMemorySpecial{2,T}(delta))
         else
-            mem = IntraPassMemoryCrossChannel{term}(delta)
+            mems = (mems..., IntraPassMemoryCrossChannel{term}(delta))
         end
-        mems = (mems..., mem)
     end
     return mems
 end
@@ -176,17 +167,16 @@ function make_states(memories; init_weight=0)
     states = ()
     for mem in memories
         if mem isa IntraPassMemoryGeneric || mem isa IntraPassMemorySpecial
-            st = IntraPassState(init_weight, 1)
+            states = (states..., IntraPassState(init_weight, 1))
         else
-            st = CrossPassState(init_weight)
+            states = (states..., CrossPassState(init_weight))
         end
-        states = (states..., st)
     end
     return states
 end
 
 # ------------------------------------------------------------
-# Compute per-pass offsets + total buffer size
+# Compute offsets for buffer
 # ------------------------------------------------------------
 
 function compute_offsets(memories)
@@ -200,14 +190,14 @@ function compute_offsets(memories)
             offsets = (offsets..., offset)
             offset += N
         else
-            offsets = (offsets..., 0)  # cross-channel: unused
+            offsets = (offsets..., 0)
         end
     end
     return offsets, max(offset, 1)
 end
 
 # ------------------------------------------------------------
-# Generated, fully unrolled chain (with offsets)
+# Generated decorrelation chain
 # ------------------------------------------------------------
 
 @generated function process_chain!(
@@ -218,11 +208,7 @@ end
     s::Stereo{T},
 ) where {N,MT<:NTuple{N,Any},ST<:NTuple{N,Any},OT<:NTuple{N,Any},TOTAL,T}
 
-    steps = Vector{Expr}(undef, N)
-    for i in 1:N
-        steps[i] = :(s, st_$i = process_pass!(memories[$i], states[$i], buf, offsets[$i], s))
-    end
-
+    steps = [:(s, st_$i = process_pass!(memories[$i], states[$i], buf, offsets[$i], s)) for i in 1:N]
     new_states = Expr(:tuple, [Symbol("st_$i") for i in 1:N]...)
 
     quote
@@ -232,76 +218,55 @@ end
 end
 
 # ------------------------------------------------------------
-# Fused hybrid block: decorrelate + shape + quantize
+# Per-channel hybrid quantizer (integer)
 # ------------------------------------------------------------
 
-"""
-    hybrid_block(data, memories; init_weight=0, qL, qR, shapeL=0.0, shapeR=0.0)
+@inline function quantize_channel(res::T,
+                                  err::T,
+                                  q::T,
+                                  α::T) where {T}
 
-Single-pass hybrid front-end:
+    shaped = res + α * err
+    half_q = q >>> 1
+    qv = (shaped + half_q) ÷ q
+    dq = qv * q
+    corr = res - dq
+    new_err = shaped - dq
 
-1. Decorrelate input `data` → residuals
-2. Noise-shape residuals (pre-quant)
-3. Quantize shaped residuals
-4. Compute correction residuals (lossless path)
-5. Update shaping error from true quantization error
+    return qv, corr, new_err
+end
 
-Returns:
-- quantized    :: Vector{Stereo{Int}} # lossy residuals (to entropy-code later)
-- correction   :: Vector{Stereo{T}}   # correction residuals (for perfect recovery)
-- final_states :: NTuple              # predictor states
-"""
+# ------------------------------------------------------------
+# Fused hybrid block (per-channel shaping + quantization)
+# ------------------------------------------------------------
+
 function hybrid_block(data::AbstractVector{Stereo{T}},
                       memories;
-                      init_weight=0,
-                      qL::Real,
-                      qR::Real,
-                      shapeL::Real=0.0,
-                      shapeR::Real=0.0) where {T}
+                      init_weight::Int=0,
+                      qL::T,
+                      qR::T,
+                      shapeL::T,
+                      shapeR::T) where {T}
 
     states = make_states(memories; init_weight)
     offsets, TOTAL = compute_offsets(memories)
     buf = MMatrix{2,TOTAL,T}(zeros(T, 2, TOTAL))
 
     n = length(data)
-
     quantized  = Vector{Stereo{Int}}(undef, n)
     correction = Vector{Stereo{T}}(undef, n)
 
     errL = zero(T)
     errR = zero(T)
 
-    αL = T(shapeL)
-    αR = T(shapeR)
-
-    qL_T = T(qL)
-    qR_T = T(qR)
-
     for i in eachindex(data)
-        # 1) decorrelate
         res, states = process_chain!(memories, states, offsets, buf, data[i])
 
-        # 2) noise shaping (pre-quant)
-        shapedL = res.l + αL * errL
-        shapedR = res.r + αR * errR
+        ql, corrL, errL = quantize_channel(res.l, errL, qL, shapeL)
+        qr, corrR, errR = quantize_channel(res.r, errR, qR, shapeR)
 
-        # 3) quantize
-        ql = round(Int, shapedL / qL_T)
-        qr = round(Int, shapedR / qR_T)
-        quantized[i] = Stereo{Int}(ql, qr)
-
-        # 4) dequantize
-        dqL = T(ql) * qL_T
-        dqR = T(qr) * qR_T
-
-        # 5) correction residual (lossless path)
-        corrL = res.l - dqL
-        corrR = res.r - dqR
+        quantized[i]  = Stereo{Int}(ql, qr)
         correction[i] = Stereo{T}(corrL, corrR)
-
-        # 6) update shaping error (true quantization error)
-        errL = shapedL - dqL
-        errR = shapedR - dqR
     end
 
     return quantized, correction, states
