@@ -232,149 +232,24 @@ end
 end
 
 # ------------------------------------------------------------
-# Lossless-style block processor (in-place residuals)
-# ------------------------------------------------------------
-
-function process_block!(data::AbstractVector{Stereo{T}},
-                        memories;
-                        init_weight=0) where {T}
-
-    states = make_states(memories; init_weight)
-    offsets, TOTAL = compute_offsets(memories)
-    buf = MMatrix{2,TOTAL,T}(zeros(T, 2, TOTAL))
-
-    for i in eachindex(data)
-        s = data[i]
-        s, states = process_chain!(memories, states, offsets, buf, s)
-        data[i] = s
-    end
-
-    return states
-end
-
-# ------------------------------------------------------------
-# Hybrid prep: decorrelation + (pluggable) noise-shaped residuals
-# ------------------------------------------------------------
-
-"""
-    prepare_hybrid_block(data, memories; init_weight=0, shapeL=0.0, shapeR=0.0)
-
-Run the decorrelator and return:
-- residuals        :: Vector{Stereo{T}}  # raw decorrelated residuals
-- shaped_residuals :: Vector{Stereo{T}}  # noise-shaped residuals (pre-quant)
-- final_states     :: NTuple            # updated predictor states
-"""
-function prepare_hybrid_block(data::AbstractVector{Stereo{T}},
-                              memories;
-                              init_weight=0,
-                              shapeL::Real=0.0,
-                              shapeR::Real=0.0) where {T}
-
-    states = make_states(memories; init_weight)
-    offsets, TOTAL = compute_offsets(memories)
-    buf = MMatrix{2,TOTAL,T}(zeros(T, 2, TOTAL))
-
-    n = length(data)
-    residuals        = Vector{Stereo{T}}(undef, n)
-    shaped_residuals = Vector{Stereo{T}}(undef, n)
-
-    errL = zero(T)
-    errR = zero(T)
-
-    αL = T(shapeL)
-    αR = T(shapeR)
-
-    for i in eachindex(data)
-        s_in = data[i]
-
-        res, states = process_chain!(memories, states, offsets, buf, s_in)
-        residuals[i] = res
-
-        shapedL = res.l + αL * errL
-        shapedR = res.r + αR * errR
-
-        shaped = Stereo{T}(shapedL, shapedR)
-        shaped_residuals[i] = shaped
-
-        # placeholder: in a real hybrid encoder, err = (res - dequantized_res)
-        errL = shapedL - res.l
-        errR = shapedR - res.r
-    end
-
-    return residuals, shaped_residuals, states
-end
-
-# ------------------------------------------------------------
-# Simple scalar quantizer for hybrid experiments
-# ------------------------------------------------------------
-
-"""
-    quantize_hybrid_block(residuals; qL, qR)
-
-Given residuals (Vector{Stereo{T}}), perform simple per-channel scalar quantization:
-
-- q = round(res / q)
-- deq = q * q
-- corr = res - deq
-
-Returns:
-- quantized      :: Vector{Stereo{Int}}
-- dequantized    :: Vector{Stereo{T}}
-- correction     :: Vector{Stereo{T}}
-"""
-function quantize_hybrid_block(residuals::AbstractVector{Stereo{T}};
-                               qL::Real,
-                               qR::Real) where {T}
-
-    n = length(residuals)
-
-    quantized   = Vector{Stereo{Int}}(undef, n)
-    dequantized = Vector{Stereo{T}}(undef, n)
-    correction  = Vector{Stereo{T}}(undef, n)
-
-    qL_T = T(qL)
-    qR_T = T(qR)
-
-    for i in eachindex(residuals)
-        r = residuals[i]
-
-        ql = round(Int, r.l / qL_T)
-        qr = round(Int, r.r / qR_T)
-
-        dqL = T(ql) * qL_T
-        dqR = T(qr) * qR_T
-
-        corrL = r.l - dqL
-        corrR = r.r - dqR
-
-        quantized[i]   = Stereo{Int}(ql, qr)
-        dequantized[i] = Stereo{T}(dqL, dqR)
-        correction[i]  = Stereo{T}(corrL, corrR)
-    end
-
-    return quantized, dequantized, correction
-end
-
-# ------------------------------------------------------------
-# Full hybrid block: decorrelate + shape + quantize
+# Fused hybrid block: decorrelate + shape + quantize
 # ------------------------------------------------------------
 
 """
     hybrid_block(data, memories; init_weight=0, qL, qR, shapeL=0.0, shapeR=0.0)
 
-High-level hybrid prep:
+Single-pass hybrid front-end:
 
 1. Decorrelate input `data` → residuals
 2. Noise-shape residuals (pre-quant)
 3. Quantize shaped residuals
+4. Compute correction residuals (lossless path)
+5. Update shaping error from true quantization error
 
 Returns:
-- residuals        :: Vector{Stereo{T}}   # raw decorrelated residuals
-- shaped_residuals :: Vector{Stereo{T}}   # shaped (pre-quant) residuals
-- quantized        :: Vector{Stereo{Int}} # lossy residuals (to entropy-code later)
-- dequantized      :: Vector{Stereo{T}}   # reconstructed residuals
-- correction       :: Vector{Stereo{T}}   # correction residuals
-- final_states     :: NTuple              # predictor states
+- quantized    :: Vector{Stereo{Int}} # lossy residuals (to entropy-code later)
+- correction   :: Vector{Stereo{T}}   # correction residuals (for perfect recovery)
+- final_states :: NTuple              # predictor states
 """
 function hybrid_block(data::AbstractVector{Stereo{T}},
                       memories;
@@ -384,16 +259,52 @@ function hybrid_block(data::AbstractVector{Stereo{T}},
                       shapeL::Real=0.0,
                       shapeR::Real=0.0) where {T}
 
-    residuals, shaped_residuals, states =
-        prepare_hybrid_block(data, memories;
-                             init_weight=init_weight,
-                             shapeL=shapeL,
-                             shapeR=shapeR)
+    states = make_states(memories; init_weight)
+    offsets, TOTAL = compute_offsets(memories)
+    buf = MMatrix{2,TOTAL,T}(zeros(T, 2, TOTAL))
 
-    quantized, dequantized, correction =
-        quantize_hybrid_block(shaped_residuals; qL=qL, qR=qR)
+    n = length(data)
 
-    return residuals, shaped_residuals, quantized, dequantized, correction, states
+    quantized  = Vector{Stereo{Int}}(undef, n)
+    correction = Vector{Stereo{T}}(undef, n)
+
+    errL = zero(T)
+    errR = zero(T)
+
+    αL = T(shapeL)
+    αR = T(shapeR)
+
+    qL_T = T(qL)
+    qR_T = T(qR)
+
+    for i in eachindex(data)
+        # 1) decorrelate
+        res, states = process_chain!(memories, states, offsets, buf, data[i])
+
+        # 2) noise shaping (pre-quant)
+        shapedL = res.l + αL * errL
+        shapedR = res.r + αR * errR
+
+        # 3) quantize
+        ql = round(Int, shapedL / qL_T)
+        qr = round(Int, shapedR / qR_T)
+        quantized[i] = Stereo{Int}(ql, qr)
+
+        # 4) dequantize
+        dqL = T(ql) * qL_T
+        dqR = T(qr) * qR_T
+
+        # 5) correction residual (lossless path)
+        corrL = res.l - dqL
+        corrR = res.r - dqR
+        correction[i] = Stereo{T}(corrL, corrR)
+
+        # 6) update shaping error (true quantization error)
+        errL = shapedL - dqL
+        errR = shapedR - dqR
+    end
+
+    return quantized, correction, states
 end
 
 end # module
