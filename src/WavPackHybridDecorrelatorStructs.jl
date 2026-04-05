@@ -1,3 +1,7 @@
+###############################
+# WavPackHybridDecorrelator.jl
+###############################
+
 # ============================================================
 # Weight application and update (WavPack-accurate)
 # ============================================================
@@ -277,8 +281,6 @@ end
 
 # ============================================================
 # Full hybrid lossless block
-# - Generates shaping arrays internally
-# - Returns quantized + correction + shaping arrays
 # ============================================================
 
 function hybrid_block(
@@ -309,7 +311,6 @@ function hybrid_block(
         L = data[i].l
         R = data[i].r
 
-        # 1. Shaping (always enabled)
         L, errL, shaping_acc_L, wL = hybrid_shape_sample_lossy!(
             L, errL, shaping_acc_L, shaping_delta_L
         )
@@ -320,17 +321,14 @@ function hybrid_block(
         shaping_array_L[i] = wL
         shaping_array_R[i] = wR
 
-        # 2. Decorrelate
         res, states = process_chain!(memories, states, bufs, Stereo{Int32}(L, R))
 
-        # 3. Quantize residuals
         qvL, corrL = quantize_residual(res.l, qL)
         qvR, corrR = quantize_residual(res.r, qR)
 
         quantized[i]  = Stereo{Int32}(qvL, qvR)
         correction[i] = Stereo{Int32}(corrL, corrR)
 
-        # 4. Error feedback
         errL = Int32(errL + qvL * qL)
         errR = Int32(errR + qvR * qR)
     end
