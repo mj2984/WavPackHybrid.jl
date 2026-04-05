@@ -2,11 +2,16 @@
 # StereoDecision.jl
 ###############################
 
-# Tuple-based decorrelation spec:
-# joint_stereo :: Bool
-# delta        :: Int32
-# terms        :: NTuple{N,Int}
-###############################
+# Requires:
+# - Stereo{T}
+# - apply_weight
+# - nosend_word
+# - make_memories, make_states, make_buffers, process_chain!
+# - nbits_table, log2_table from WavPackHybridTables.jl
+
+############################################################
+# 1. Decorrelation Spec
+############################################################
 
 struct DecorrSpec{N}
     joint_stereo::Bool
@@ -14,15 +19,7 @@ struct DecorrSpec{N}
     terms::NTuple{N,Int}
 end
 
-# --------------------------------
-# Build specs from WavpackDecorrelationTables
-# Each entry: (joint::Int, delta::Int, terms::NTuple{N,Int})
-# --------------------------------
-
-function load_specs_from_tables(
-    tables::Dict{Symbol,Vector},
-    key::Symbol,
-)
+function load_specs_from_tables(tables::Dict{Symbol,Vector}, key::Symbol)
     raw = tables[key]
     specs = DecorrSpec[]
     for (joint, delta, terms) in raw
@@ -33,14 +30,58 @@ function load_specs_from_tables(
     return specs
 end
 
-# Example (in your main code):
-# const DEFAULT_SPECS_JL = load_specs_from_tables(WavpackDecorrelationTables, :default)
-# const FAST_SPECS_JL    = load_specs_from_tables(WavpackDecorrelationTables, :fast)
-# const VERY_HIGH_SPECS_JL = load_specs_from_tables(WavpackDecorrelationTables, :very_high)
+############################################################
+# 2. wp_log2 (bit-exact)
+############################################################
 
-# --------------------------------
-# Mid/side transform (JS trial)
-# --------------------------------
+@inline function wp_log2(avalue::UInt32)
+    av = avalue + (avalue >> 9)
+
+    if av < 0x100
+        dbits = nbits_table[Int(av) + 1]
+        idx   = Int((av << (9 - dbits)) & 0xff) + 1
+        return (UInt32(dbits) << 8) + UInt32(log2_table[idx])
+    else
+        dbits::Int
+        if av < 0x10000
+            dbits = nbits_table[Int(av >> 8) + 1] + 8
+        elseif av < 0x1000000
+            dbits = nbits_table[Int(av >> 16) + 1] + 16
+        else
+            dbits = nbits_table[Int(av >> 24) + 1] + 24
+        end
+
+        idx = Int((av >> (dbits - 9)) & 0xff) + 1
+        return (UInt32(dbits) << 8) + UInt32(log2_table[idx])
+    end
+end
+
+############################################################
+# 3. log2buffer (bit-exact)
+############################################################
+
+@inline function log2buffer(res::Vector{Stereo{Int32}}; limit::UInt32 = 0)
+    acc = UInt32(0)
+
+    @inbounds for s in res
+        for v in (s.l, s.r)
+            av = UInt32(abs(v))
+            val = wp_log2(av)
+
+            if limit != 0 && val >= limit
+                return typemax(UInt32)   # matches C: return (uint32_t)-1
+            end
+
+            acc += val
+        end
+    end
+
+    return acc
+end
+
+############################################################
+# 4. Mid/Side Transform
+############################################################
 
 function to_joint_stereo(data::Vector{Stereo{Int32}})
     out = similar(data)
@@ -54,39 +95,104 @@ function to_joint_stereo(data::Vector{Stereo{Int32}})
     return out
 end
 
-# --------------------------------
-# log2 "size" of residual buffer
-# --------------------------------
+############################################################
+# 5. Noisy Buffer (bit-exact stereo_add_noise)
+############################################################
 
-@inline function log2buffer(res::Vector{Stereo{Int32}}; log_limit::Int32 = 0)
-    acc = Int64(0)
-    @inbounds for s in res
-        for v in (s.l, s.r)
-            x = abs(Int64(v)) + 1
-            if x == 0
-                continue
+function stereo_add_noise!(wps, noisy::Vector{Stereo{Int32}},
+                           orig::Vector{Stereo{Int32}})
+    flags = wps.wphdr.flags
+    hybrid_shape = (flags & HYBRID_SHAPE) != 0
+    is_new       = (flags & NEW_SHAPING) != 0
+
+    shaping_array = wps.dc.shaping_array
+
+    error0 = Int32(0)
+    error1 = Int32(0)
+
+    cnt = length(orig)
+
+    if hybrid_shape
+        acc0 = wps.dc.shaping_acc[1]
+        acc1 = wps.dc.shaping_acc[2]
+        δ0   = wps.dc.shaping_delta[1]
+        δ1   = wps.dc.shaping_delta[2]
+
+        idx_sa = 1
+
+        @inbounds for i in 1:cnt
+            s = orig[i]
+
+            # ----- channel 0 -----
+            shaping_weight0 = shaping_array !== nothing ?
+                Int32(shaping_array[idx_sa]) :
+                begin acc0 += δ0; acc0 >> 16 end
+
+            temp0 = -apply_weight(shaping_weight0, error0)
+            q0    = nosend_word(wps, s.l, 0)
+            base_err0 = q0 - s.l
+
+            if is_new && shaping_weight0 < 0 && temp0 != 0
+                if temp0 == error0
+                    temp0 += temp0 < 0 ? 1 : -1
+                end
+                error0 = base_err0 + temp0
+            else
+                error0 = base_err0 + temp0
             end
-            bits = 63 - leading_zeros(x)
-            frac = bits == 0 ? 0 : ((x << (63 - bits)) >>> 55)
-            val = Int32(bits * 256 + (frac & 0xff))
-            if log_limit != 0 && val > log_limit
-                val = log_limit
+
+            noisyL = s.l + error0
+
+            # ----- channel 1 -----
+            shaping_weight1 = begin acc1 += δ1; acc1 >> 16 end
+
+            temp1 = -apply_weight(shaping_weight1, error1)
+            q1    = nosend_word(wps, s.r, 1)
+            base_err1 = q1 - s.r
+
+            if is_new && shaping_weight1 < 0 && temp1 != 0
+                if temp1 == error1
+                    temp1 += temp1 < 0 ? 1 : -1
+                end
+                error1 = base_err1 + temp1
+            else
+                error1 = base_err1 + temp1
             end
-            acc += val
+
+            noisyR = s.r + error1
+
+            noisy[i] = Stereo{Int32}(noisyL, noisyR)
+
+            if shaping_array !== nothing
+                idx_sa += 1
+            end
+        end
+
+        if shaping_array === nothing
+            acc0 -= δ0 * cnt
+            acc1 -= δ1 * cnt
+        end
+
+        wps.dc.shaping_acc = (acc0, acc1)
+
+    else
+        @inbounds for i in 1:cnt
+            s = orig[i]
+            q0 = nosend_word(wps, s.l, 0)
+            q1 = nosend_word(wps, s.r, 1)
+            noisy[i] = Stereo{Int32}(s.l + (q0 - s.l),
+                                     s.r + (q1 - s.r))
         end
     end
-    return acc
+
+    return noisy
 end
 
-# --------------------------------
-# Single decorrelation trial
-# --------------------------------
+############################################################
+# 6. Single decorrelation trial
+############################################################
 
-function trial_chain(
-    data::Vector{Stereo{Int32}},
-    memories;
-    init_weight::Int32 = 0,
-)
+function trial_chain(data::Vector{Stereo{Int32}}, memories; init_weight::Int32 = 0)
     states = make_states(memories; init_weight)
     bufs   = make_buffers(memories)
 
@@ -103,17 +209,13 @@ function trial_chain(
     return res
 end
 
-# --------------------------------
-# Stereo mode chooser (TS vs JS)
-# --------------------------------
-# Returns:
-#   samples  :: modified in-place to best residuals
-#   memories :: best decorrelation chain (NTuple)
-#   use_js   :: Bool, whether JOINT_STEREO should be set
-# --------------------------------
+############################################################
+# 7. Stereo Mode Chooser (now uses noisy buffer)
+############################################################
 
 function choose_stereo_mode!(
-    samples::Vector{Stereo{Int32}},
+    wps,
+    orig_samples::Vector{Stereo{Int32}},
     specs::Vector{DecorrSpec};
     num_passes::Int = 1,
     init_weight::Int32 = 0,
@@ -121,20 +223,19 @@ function choose_stereo_mode!(
     force_ts::Bool = false,
 )
 
-    n = length(samples)
+    n = length(orig_samples)
 
-    all_zero = true
-    @inbounds for s in samples
-        if s.l != 0 || s.r != 0
-            all_zero = false
-            break
-        end
-    end
+    # Build noisy buffer (bit-exact)
+    noisy = similar(orig_samples)
+    stereo_add_noise!(wps, noisy, orig_samples)
+
+    # If all zero, skip
+    all_zero = all(s -> s.l == 0 && s.r == 0, noisy)
     if all_zero
-        return samples, nothing, false
+        return noisy, nothing, false
     end
 
-    best_size = typemax(Int64)
+    best_size = typemax(UInt64)
     best_res  = Vector{Stereo{Int32}}(undef, n)
     best_mem  = nothing
     best_js   = false
@@ -146,18 +247,18 @@ function choose_stereo_mode!(
             use_js = force_js || (spec.joint_stereo && !force_ts)
 
             trial_in = if use_js
-                js_buf === nothing && (js_buf = to_joint_stereo(samples))
+                js_buf === nothing && (js_buf = to_joint_stereo(noisy))
                 js_buf
             else
-                samples
+                noisy
             end
 
             N = length(spec.terms)
-            deltas = ntuple(i -> spec.delta, N)
+            deltas = ntuple(_ -> spec.delta, N)
             memories = make_memories(Int32, spec.terms, deltas)
             res = trial_chain(trial_in, memories; init_weight)
 
-            size = log2buffer(res)
+            size = UInt64(log2buffer(res))
 
             if size < best_size
                 best_size = size
@@ -168,9 +269,5 @@ function choose_stereo_mode!(
         end
     end
 
-    @inbounds for i in 1:n
-        samples[i] = best_res[i]
-    end
-
-    return samples, best_mem, best_js
+    return best_res, best_mem, best_js
 end
