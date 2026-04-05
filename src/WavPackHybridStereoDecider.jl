@@ -197,26 +197,25 @@ end
 ############################################################
 # 8. log2buffer (bit-exact)
 ############################################################
-
-@inline function log2buffer(res::Vector{Stereo{Int32}}; limit::UInt32 = 0)
-    acc = UInt32(0)
-
+@inline function log2buffer(res::Vector{Stereo{Int32}}; log_limit::Int32 = 0)
+    acc = Int64(0)
     @inbounds for s in res
         for v in (s.l, s.r)
-            av = UInt32(abs(v))
-            val = wp_log2(av)
-
-            if limit != 0 && val >= limit
-                return typemax(UInt32)
+            x = abs(Int64(v)) + 1
+            if x == 0
+                continue
             end
-
+            bits = 63 - leading_zeros(x)
+            frac = bits == 0 ? 0 : ((x << (63 - bits)) >>> 55)
+            val = Int32(bits * 256 + (frac & 0xff))
+            if log_limit != 0 && val > log_limit
+                val = log_limit
+            end
             acc += val
         end
     end
-
     return acc
 end
-
 ############################################################
 # 9. Mid/side transform
 ############################################################
