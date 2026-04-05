@@ -1,8 +1,3 @@
-module WavPackHybridDecorrelators
-
-using StaticArrays
-using SamplesCore: Stereo
-
 # ============================================================
 # Weight application and update (WavPack-accurate)
 # ============================================================
@@ -375,5 +370,3 @@ function hybrid_block(
 
     return quantized, correction, states
 end
-
-end # module
