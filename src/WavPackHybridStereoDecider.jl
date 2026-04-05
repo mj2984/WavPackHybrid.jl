@@ -2,12 +2,182 @@
 # StereoDecision.jl
 ###############################
 
-# Requires:
-# - Stereo{T}
-# - apply_weight
-# - nosend_word
-# - make_memories, make_states, make_buffers, process_chain!
-# - nbits_table, log2_table from WavPackHybridTables.jl
+# Assumes:
+# - wp_log2(avalue::UInt32)::UInt32 is defined (e.g. in StereoDecision.jl)
+# - WavpackStream has a field `w` of type WordsData
+
+###############################
+# 1. Constants
+###############################
+
+const SLS  = 8
+const SLO  = 1 << (SLS - 1)
+
+const LIMIT_ONES = 16
+
+const DIV0 = 128
+const DIV1 = 64
+const DIV2 = 32
+
+###############################
+# 2. Entropy / words state
+###############################
+
+mutable struct EntropyData
+    median::Vector{UInt32}   # length 3
+    error_limit::UInt32
+    slow_level::UInt32
+end
+
+mutable struct WordsData
+    bitrate_delta::NTuple{2,UInt32}
+    bitrate_acc::NTuple{2,UInt32}
+    pend_data::UInt32
+    holding_one::UInt32
+    zeros_acc::UInt32
+    holding_zero::Int32
+    pend_count::Int32
+    c::NTuple{2,EntropyData}
+end
+
+###############################
+# 3. Median helpers (GET_MED / INC / DEC)
+###############################
+
+@inline get_med(c::EntropyData, idx::Int)::UInt32 =
+    (c.median[idx] >> 4) + 1
+
+@inline function inc_med0!(c::EntropyData)
+    m = c.median
+    m0 = m[1] + ((m[1] + DIV0) ÷ DIV0) * 5
+    c.median[1] = m0
+    return
+end
+
+@inline function dec_med0!(c::EntropyData)
+    m = c.median
+    m0 = m[1] - ((m[1] + (DIV0 - 2)) ÷ DIV0) * 2
+    c.median[1] = m0
+    return
+end
+
+@inline function inc_med1!(c::EntropyData)
+    m = c.median
+    m1 = m[2] + ((m[2] + DIV1) ÷ DIV1) * 5
+    c.median[2] = m1
+    return
+end
+
+@inline function dec_med1!(c::EntropyData)
+    m = c.median
+    m1 = m[2] - ((m[2] + (DIV1 - 2)) ÷ DIV1) * 2
+    c.median[2] = m1
+    return
+end
+
+@inline function inc_med2!(c::EntropyData)
+    m = c.median
+    m2 = m[3] + ((m[3] + DIV2) ÷ DIV2) * 5
+    c.median[3] = m2
+    return
+end
+
+@inline function dec_med2!(c::EntropyData)
+    m = c.median
+    m2 = m[3] - ((m[3] + (DIV2 - 2)) ÷ DIV2) * 2
+    c.median[3] = m2
+    return
+end
+
+###############################
+# 4. update_error_limit! (stub)
+###############################
+# You need to port this from the C encoder; it uses:
+# - wps.w.bitrate_delta / bitrate_acc
+# - c.slow_level
+# to compute c.error_limit.
+###############################
+
+function update_error_limit!(wps)
+    # TODO: port from WavPack C:
+    #   void update_error_limit (WavpackStream *wps)
+    return
+end
+
+###############################
+# 5. nosend_word (bit-exact)
+###############################
+
+function nosend_word(wps, value::Int32, chan::Int)
+    wd = wps.w::WordsData
+    c  = wd.c[chan + 1]
+
+    sign = value < 0
+    v = sign ? ~value : value
+
+    # HYBRID_FLAG check lives on wps.wphdr.flags in C;
+    # here we assume you expose it similarly.
+    if (wps.wphdr.flags & HYBRID_FLAG) != 0 && chan == 0
+        update_error_limit!(wps)
+    end
+
+    low  = UInt32(0)
+    high = UInt32(0)
+    ones_count = UInt32(0)
+
+    med0 = get_med(c, 1)
+    if v < Int32(med0)
+        low  = 0x00000000
+        high = med0 - 1
+        dec_med0!(c)
+    else
+        low  = med0
+        inc_med0!(c)
+
+        med1 = get_med(c, 2)
+        if v - Int32(low) < Int32(med1)
+            high = low + med1 - 1
+            dec_med1!(c)
+        else
+            low += med1
+            inc_med1!(c)
+
+            med2 = get_med(c, 3)
+            if v - Int32(low) < Int32(med2)
+                high = low + med2 - 1
+                dec_med2!(c)
+            else
+                ones_count = 2 + UInt32((v - Int32(low)) ÷ Int32(med2))
+                low  += (ones_count - 2) * med2
+                high  = low + med2 - 1
+                inc_med2!(c)
+            end
+        end
+    end
+
+    mid = (high + low + 1) >> 1
+
+    if c.error_limit == 0
+        mid = UInt32(v)
+    else
+        while high - low > c.error_limit
+            if v < Int32(mid)
+                high = mid - 1
+                mid  = (high + low + 1) >> 1
+            else
+                low  = mid
+                mid  = (high + low + 1) >> 1
+            end
+        end
+    end
+
+    # slow_level update
+    c.slow_level -= (c.slow_level + SLO) >> SLS
+    c.slow_level += wp_log2(mid)
+
+    out = sign ? ~Int32(mid) : Int32(mid)
+    return out
+end
 
 ############################################################
 # 1. Decorrelation Spec
