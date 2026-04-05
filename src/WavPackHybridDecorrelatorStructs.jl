@@ -14,16 +14,6 @@ end
     return weight
 end
 
-@inline function update_weight_clip(weight::Int32, delta::Int32, source::Int32, result::Int32)
-    if source != 0 && result != 0
-        s = (source ⊻ result) >> 31
-        weight = (weight ⊻ s) + (delta - s)
-        weight = weight > 1024 ? 1024 : weight
-        weight = (weight ⊻ s) - s
-    end
-    return weight
-end
-
 # ============================================================
 # Memory types
 # ============================================================
@@ -244,32 +234,22 @@ end
 end
 
 # ============================================================
-# Hybrid shaping (WavPack-accurate)
+# Hybrid shaping (hybrid lossless only)
+# NEW_SHAPING always enabled
 # ============================================================
 
-@inline function hybrid_shape_sample!(
+@inline function hybrid_shape_sample_lossy!(
     sample::Int32,
     err::Int32,
     shaping_acc::Int32,
     shaping_delta::Int32,
-    shaping_array::Union{Nothing,Vector{Int16}},
-    idx::Int,
-    flags::UInt32
 )
-    NEW_SHAPING = 0x00000010
-
-    shaping_weight::Int32
-
-    if shaping_array !== nothing
-        shaping_weight = shaping_array[idx]
-    else
-        shaping_acc = Int32(shaping_acc + shaping_delta)
-        shaping_weight = shaping_acc >> 16
-    end
+    shaping_acc = Int32(shaping_acc + shaping_delta)
+    shaping_weight = Int32(shaping_acc >> 16)
 
     temp = -apply_weight(shaping_weight, err)
 
-    if (flags & NEW_SHAPING != 0) && shaping_weight < 0 && temp != 0
+    if shaping_weight < 0 && temp != 0
         if temp == err
             temp += temp < 0 ? Int32(1) : Int32(-1)
         end
@@ -280,7 +260,7 @@ end
         err = -sample
     end
 
-    return sample, err, shaping_acc
+    return sample, err, shaping_acc, Int16(shaping_weight)
 end
 
 # ============================================================
@@ -296,7 +276,9 @@ end
 end
 
 # ============================================================
-# Full hybrid block
+# Full hybrid lossless block
+# - Generates shaping arrays internally
+# - Returns quantized + correction + shaping arrays
 # ============================================================
 
 function hybrid_block(
@@ -307,48 +289,51 @@ function hybrid_block(
     qR::Int32,
     shaping_delta_L::Int32,
     shaping_delta_R::Int32,
-    flags::UInt32,
-    shaping_array_L::Union{Nothing,Vector{Int16}} = nothing,
-    shaping_array_R::Union{Nothing,Vector{Int16}} = nothing
 )
 
     states = make_states(memories; init_weight)
     bufs   = make_buffers(memories)
 
     n = length(data)
-    quantized  = Vector{Stereo{Int32}}(undef, n)
-    correction = Vector{Stereo{Int32}}(undef, n)
+    quantized       = Vector{Stereo{Int32}}(undef, n)
+    correction      = Vector{Stereo{Int32}}(undef, n)
+    shaping_array_L = Vector{Int16}(undef, n)
+    shaping_array_R = Vector{Int16}(undef, n)
 
     errL = Int32(0)
     errR = Int32(0)
     shaping_acc_L = Int32(0)
     shaping_acc_R = Int32(0)
 
-    for i in 1:n
+    @inbounds for i in 1:n
         L = data[i].l
         R = data[i].r
 
-        L, errL, shaping_acc_L = hybrid_shape_sample!(
-            L, errL, shaping_acc_L, shaping_delta_L,
-            shaping_array_L, i, flags
+        # 1. Shaping (always enabled)
+        L, errL, shaping_acc_L, wL = hybrid_shape_sample_lossy!(
+            L, errL, shaping_acc_L, shaping_delta_L
+        )
+        R, errR, shaping_acc_R, wR = hybrid_shape_sample_lossy!(
+            R, errR, shaping_acc_R, shaping_delta_R
         )
 
-        R, errR, shaping_acc_R = hybrid_shape_sample!(
-            R, errR, shaping_acc_R, shaping_delta_R,
-            shaping_array_R, i, flags
-        )
+        shaping_array_L[i] = wL
+        shaping_array_R[i] = wR
 
+        # 2. Decorrelate
         res, states = process_chain!(memories, states, bufs, Stereo{Int32}(L, R))
 
+        # 3. Quantize residuals
         qvL, corrL = quantize_residual(res.l, qL)
         qvR, corrR = quantize_residual(res.r, qR)
 
         quantized[i]  = Stereo{Int32}(qvL, qvR)
         correction[i] = Stereo{Int32}(corrL, corrR)
 
+        # 4. Error feedback
         errL = Int32(errL + qvL * qL)
         errR = Int32(errR + qvR * qR)
     end
 
-    return quantized, correction, states
+    return quantized, correction, states, shaping_array_L, shaping_array_R
 end
