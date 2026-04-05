@@ -1,5 +1,7 @@
 module WavPackHybrid
-using BitIntegers, SamplesCore
+using StaticArrays, SamplesCore
+include("WavPackHybridDecorrelatorStructs.jl")
+include("WavPackHybridReverseDecorrelatorMethods.jl")
 export encode, decode, test_codec
 
 # -------------------------
