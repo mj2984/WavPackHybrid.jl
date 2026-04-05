@@ -11,7 +11,7 @@ struct IntraPassMemoryGeneric{N,T}
     delta::Int
 end
 
-struct IntraPassMemorySpecial{N,T}
+struct IntraPassMemorySpecial{term,T}
     delta::Int
 end
 
@@ -33,7 +33,7 @@ struct CrossPassState
 end
 
 # ------------------------------------------------------------
-# Intra-channel decorrelation pass
+# Intra-channel decorrelation pass (generic terms 1–8)
 # ------------------------------------------------------------
 
 @inline function process_pass!(
@@ -66,32 +66,58 @@ end
     return Stereo{T}(resL, resR), IntraPassState(new_weight, new_idx)
 end
 
+# ------------------------------------------------------------
+# Intra-channel decorrelation pass (special terms 17 & 18)
+# ------------------------------------------------------------
+
 @inline function process_pass!(
-    mem::IntraPassMemorySpecial{N,T},
+    mem::IntraPassMemorySpecial{term,T},
     st::IntraPassState,
     buf::MMatrix{2,TOTAL,T},
     offset::Int,
     s::Stereo{T},
-) where {N,T,TOTAL}
+) where {term,T,TOTAL}
 
     L = s.l
     R = s.r
 
-    bi = offset + st.idx
-    dL = buf[1, bi]
-    dR = buf[2, bi]
+    # two-sample history indices
+    i0 = offset + st.idx
+    i1 = offset + (st.idx == 1 ? 2 : st.idx - 1)
 
-    predL = (st.weight * dL) >>> 10
-    predR = (st.weight * dR) >>> 10
+    xL0 = buf[1, i0]
+    xL1 = buf[1, i1]
+    xR0 = buf[2, i0]
+    xR1 = buf[2, i1]
+
+    # predictor selection
+    if term == 17
+        # pred = 2*x[n-1] - x[n-2]
+        samL = 2*xL0 - xL1
+        samR = 2*xR0 - xR1
+    elseif term == 18
+        # pred = x[n-1] + (x[n-1] - x[n-2]) >> 1
+        samL = xL0 + ((xL0 - xL1) >>> 1)
+        samR = xR0 + ((xR0 - xR1) >>> 1)
+    else
+        error("IntraPassMemorySpecial used with unsupported term = $term")
+    end
+
+    predL = (st.weight * samL) >>> 10
+    predR = (st.weight * samR) >>> 10
 
     resL = L - predL
     resR = R - predR
 
     new_weight = st.weight + (resL > 0 ? mem.delta : (resL < 0 ? -mem.delta : 0))
-    new_idx    = st.idx == N ? 1 : st.idx + 1
 
-    buf[1, bi] = L
-    buf[2, bi] = R
+    # rotate history
+    buf[1, i1] = xL0
+    buf[2, i1] = xR0
+    buf[1, i0] = L
+    buf[2, i0] = R
+
+    new_idx = (st.idx == 2 ? 1 : st.idx + 1)
 
     return Stereo{T}(resL, resR), IntraPassState(new_weight, new_idx)
 end
@@ -153,9 +179,9 @@ function make_memories(::Type{T}, terms, deltas) where {T}
         if 1 ≤ term ≤ 8
             mems = (mems..., IntraPassMemoryGeneric{term,T}(delta))
         elseif term == 17
-            mems = (mems..., IntraPassMemorySpecial{1,T}(delta))
+            mems = (mems..., IntraPassMemorySpecial{17,T}(delta))
         elseif term == 18
-            mems = (mems..., IntraPassMemorySpecial{2,T}(delta))
+            mems = (mems..., IntraPassMemorySpecial{18,T}(delta))
         else
             mems = (mems..., IntraPassMemoryCrossChannel{term}(delta))
         end
@@ -186,9 +212,9 @@ function compute_offsets(memories)
         if mem isa IntraPassMemoryGeneric{N,T} where {N,T}
             offsets = (offsets..., offset)
             offset += N
-        elseif mem isa IntraPassMemorySpecial{N,T} where {N,T}
+        elseif mem isa IntraPassMemorySpecial{term,T} where {term,T}
             offsets = (offsets..., offset)
-            offset += N
+            offset += 2          # special terms 17 & 18 use 2-sample history
         else
             offsets = (offsets..., 0)
         end
