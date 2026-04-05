@@ -4,13 +4,13 @@
 
 # Tuple-based decorrelation spec:
 # joint_stereo :: Bool
-# deltas       :: NTuple{N,Int32}
+# delta        :: Int32
 # terms        :: NTuple{N,Int}
 ###############################
 
 struct DecorrSpec{N}
     joint_stereo::Bool
-    deltas::NTuple{N,Int32}
+    delta::Int32
     terms::NTuple{N,Int}
 end
 
@@ -28,15 +28,15 @@ function load_specs_from_tables(
     for (joint, delta, terms) in raw
         N = length(terms)
         tnt = ntuple(i -> Int(terms[i]), N)
-        dnt = ntuple(i -> Int32(delta), N)
-        push!(specs, DecorrSpec{N}(joint != 0, dnt, tnt))
+        push!(specs, DecorrSpec{N}(joint != 0, Int32(delta), tnt))
     end
     return specs
 end
 
-# Example usage (in your main code):
+# Example (in your main code):
 # const DEFAULT_SPECS_JL = load_specs_from_tables(WavpackDecorrelationTables, :default)
 # const FAST_SPECS_JL    = load_specs_from_tables(WavpackDecorrelationTables, :fast)
+# const VERY_HIGH_SPECS_JL = load_specs_from_tables(WavpackDecorrelationTables, :very_high)
 
 # --------------------------------
 # Mid/side transform (JS trial)
@@ -152,7 +152,9 @@ function choose_stereo_mode!(
                 samples
             end
 
-            memories = make_memories(Int32, spec.terms, spec.deltas)
+            N = length(spec.terms)
+            deltas = ntuple(i -> spec.delta, N)
+            memories = make_memories(Int32, spec.terms, deltas)
             res = trial_chain(trial_in, memories; init_weight)
 
             size = log2buffer(res)
