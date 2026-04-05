@@ -2,7 +2,6 @@ module WavPackHybridDecorrelators
 
 using StaticArrays
 using SamplesCore: Stereo
-using LinearAlgebra
 
 # ============================================================
 # Weight application and update (WavPack-accurate)
