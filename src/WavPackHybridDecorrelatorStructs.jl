@@ -1,3 +1,14 @@
+using StaticArrays
+
+# ============================================================
+# Utility types
+# ============================================================
+
+struct Stereo{T}
+    l::T
+    r::T
+end
+
 # ============================================================
 # Weight application and update (WavPack-accurate)
 # ============================================================
@@ -25,7 +36,7 @@ end
 end
 
 # ============================================================
-# Pass memory types
+# Memory types
 # ============================================================
 
 struct IntraPassMemoryGeneric{N,T}
@@ -60,15 +71,14 @@ end
 @inline function process_pass!(
     mem::IntraPassMemoryGeneric{N,T},
     st::IntraPassState,
-    buf::MMatrix{2,TOTAL,T},
-    offset::Int,
+    buf::MMatrix{2,N,Int32},
     s::Stereo{T},
-) where {N,T,TOTAL}
+) where {N,T}
 
     L = s.l
     R = s.r
 
-    bi = offset + st.idx
+    bi = st.idx
     dL = buf[1, bi]
     dR = buf[2, bi]
 
@@ -78,8 +88,8 @@ end
     resL = L - predL
     resR = R - predR
 
-    new_weight = st.weight + (resL > 0 ? mem.delta : (resL < 0 ? -mem.delta : 0))
-    new_idx    = st.idx == N ? 1 : st.idx + 1
+    new_weight = update_weight(st.weight, mem.delta, dL, resL)
+    new_idx    = (st.idx == N ? 1 : st.idx + 1)
 
     buf[1, bi] = L
     buf[2, bi] = R
@@ -94,16 +104,15 @@ end
 @inline function process_pass!(
     mem::IntraPassMemorySpecial{term,T},
     st::IntraPassState,
-    buf::MMatrix{2,TOTAL,T},
-    offset::Int,
+    buf::MMatrix{2,2,Int32},
     s::Stereo{T},
-) where {term,T,TOTAL}
+) where {term,T}
 
     L = s.l
     R = s.r
 
-    i0 = offset + st.idx
-    i1 = offset + (st.idx == 1 ? 2 : st.idx - 1)
+    i0 = st.idx
+    i1 = (i0 == 1 ? 2 : 1)
 
     xL0 = buf[1, i0]; xL1 = buf[1, i1]
     xR0 = buf[2, i0]; xR1 = buf[2, i1]
@@ -124,14 +133,14 @@ end
     resL = L - predL
     resR = R - predR
 
-    new_weight = st.weight + (resL > 0 ? mem.delta : (resL < 0 ? -mem.delta : 0))
+    new_weight = update_weight(st.weight, mem.delta, samL, resL)
 
     buf[1, i1] = xL0
     buf[2, i1] = xR0
     buf[1, i0] = L
     buf[2, i0] = R
 
-    new_idx = st.idx == 2 ? 1 : st.idx + 1
+    new_idx = (i0 == 2 ? 1 : 2)
 
     return Stereo{T}(resL, resR), IntraPassState(new_weight, new_idx)
 end
@@ -143,6 +152,7 @@ end
 @inline function process_pass!(
     mem::IntraPassMemoryCrossChannel{term},
     st::CrossPassState,
+    ::Nothing,
     s::Stereo{T},
 ) where {T,term}
 
@@ -151,16 +161,14 @@ end
     if term == -1
         pred = (st.weight * L) >>> 10
         resR = R - pred
-        resL = L
-        new_weight = st.weight + (resR > 0 ? mem.delta : (resR < 0 ? -mem.delta : 0))
-        return Stereo{T}(resL, resR), CrossPassState(new_weight)
+        new_weight = update_weight(st.weight, mem.delta, L, resR)
+        return Stereo{T}(L, resR), CrossPassState(new_weight)
 
     elseif term == -2
         pred = (st.weight * R) >>> 10
         resL = L - pred
-        resR = R
-        new_weight = st.weight + (resL > 0 ? mem.delta : (resL < 0 ? -mem.delta : 0))
-        return Stereo{T}(resL, resR), CrossPassState(new_weight)
+        new_weight = update_weight(st.weight, mem.delta, R, resL)
+        return Stereo{T}(resL, R), CrossPassState(new_weight)
 
     elseif term == -3
         predL = (st.weight * R) >>> 10
@@ -168,18 +176,10 @@ end
         resL = L - predL
         resR = R - predR
         err = resL + resR
-        new_weight = st.weight + (err > 0 ? mem.delta : (err < 0 ? -mem.delta : 0))
+        new_weight = update_weight(st.weight, mem.delta, err, err)
         return Stereo{T}(resL, resR), CrossPassState(new_weight)
     end
 end
-
-@inline process_pass!(
-    mem::IntraPassMemoryCrossChannel{term},
-    st::CrossPassState,
-    buf::MMatrix{2,TOTAL,T},
-    offset::Int,
-    s::Stereo{T},
-) where {T,term,TOTAL} = process_pass!(mem, st, s)
 
 # ============================================================
 # Memory + state constructors
@@ -214,24 +214,21 @@ function make_states(memories; init_weight=0)
 end
 
 # ============================================================
-# Compute offsets for buffer
+# Per-stage buffer constructor (tuple of MMatrices)
 # ============================================================
 
-function compute_offsets(memories)
-    offsets = ()
-    offset = 0
+function make_buffers(memories)
+    bufs = ()
     for mem in memories
         if mem isa IntraPassMemoryGeneric{N,T} where {N,T}
-            offsets = (offsets..., offset)
-            offset += N
-        elseif mem isa IntraPassMemorySpecial{term,T} where {term,T}
-            offsets = (offsets..., offset)
-            offset += 2
+            bufs = (bufs..., MMatrix{2,N,Int32}(zeros(Int32,2,N)))
+        elseif mem isa IntraPassMemorySpecial
+            bufs = (bufs..., MMatrix{2,2,Int32}(zeros(Int32,2,2)))
         else
-            offsets = (offsets..., 0)
+            bufs = (bufs..., nothing)
         end
     end
-    return offsets, max(offset, 1)
+    return bufs
 end
 
 # ============================================================
@@ -241,12 +238,14 @@ end
 @generated function process_chain!(
     memories::MT,
     states::ST,
-    offsets::OT,
-    buf::MMatrix{2,TOTAL,T},
+    bufs::BT,
     s::Stereo{T},
-) where {N,MT<:NTuple{N,Any},ST<:NTuple{N,Any},OT<:NTuple{N,Any},TOTAL,T}
+) where {N,MT<:NTuple{N,Any},ST<:NTuple{N,Any},BT<:NTuple{N,Any},T}
 
-    steps = [:(s, st_$i = process_pass!(memories[$i], states[$i], buf, offsets[$i], s)) for i in 1:N]
+    steps = []
+    for i in 1:N
+        push!(steps, :(s, st_$i = process_pass!(memories[$i], states[$i], bufs[$i], s)))
+    end
     new_states = Expr(:tuple, [Symbol("st_$i") for i in 1:N]...)
 
     quote
@@ -268,15 +267,14 @@ end
     idx::Int,
     flags::UInt32
 )
-    HYBRID_SHAPE = 0x00000008
-    NEW_SHAPING  = 0x00000010
+    NEW_SHAPING = 0x00000010
 
     shaping_weight::Int32
 
     if shaping_array !== nothing
         shaping_weight = shaping_array[idx]
     else
-        shaping_acc += shaping_delta
+        shaping_acc = Int32(shaping_acc + shaping_delta)
         shaping_weight = shaping_acc >> 16
     end
 
@@ -284,12 +282,12 @@ end
 
     if (flags & NEW_SHAPING != 0) && shaping_weight < 0 && temp != 0
         if temp == err
-            temp += temp < 0 ? 1 : -1
+            temp += temp < 0 ? Int32(1) : Int32(-1)
         end
         err = -sample
-        sample += temp
+        sample = Int32(sample + temp)
     else
-        sample += temp
+        sample = Int32(sample + temp)
         err = -sample
     end
 
@@ -303,13 +301,13 @@ end
 @inline function quantize_residual(res::Int32, q::Int32)
     half_q = q >>> 1
     qv = (res + half_q) ÷ q
-    dq = qv * q
-    corr = res - dq
+    dq = Int32(qv * q)
+    corr = Int32(res - dq)
     return qv, corr
 end
 
 # ============================================================
-# Full hybrid block (shaping + decorrelation + quantization)
+# Full hybrid block
 # ============================================================
 
 function hybrid_block(
@@ -326,8 +324,7 @@ function hybrid_block(
 )
 
     states = make_states(memories; init_weight)
-    offsets, TOTAL = compute_offsets(memories)
-    buf = MMatrix{2,TOTAL,Int32}(zeros(Int32, 2, TOTAL))
+    bufs   = make_buffers(memories)
 
     n = length(data)
     quantized  = Vector{Stereo{Int32}}(undef, n)
@@ -342,7 +339,6 @@ function hybrid_block(
         L = data[i].l
         R = data[i].r
 
-        # 1. Pre-decorrelation shaping
         L, errL, shaping_acc_L = hybrid_shape_sample!(
             L, errL, shaping_acc_L, shaping_delta_L,
             shaping_array_L, i, flags
@@ -353,19 +349,16 @@ function hybrid_block(
             shaping_array_R, i, flags
         )
 
-        # 2. Decorrelate
-        res, states = process_chain!(memories, states, offsets, buf, Stereo{Int32}(L, R))
+        res, states = process_chain!(memories, states, bufs, Stereo{Int32}(L, R))
 
-        # 3. Quantize residuals
         qvL, corrL = quantize_residual(res.l, qL)
         qvR, corrR = quantize_residual(res.r, qR)
 
         quantized[i]  = Stereo{Int32}(qvL, qvR)
         correction[i] = Stereo{Int32}(corrL, corrR)
 
-        # 4. Post-quantization error feedback
-        errL += qvL * qL
-        errR += qvR * qR
+        errL = Int32(errL + qvL * qL)
+        errR = Int32(errR + qvR * qR)
     end
 
     return quantized, correction, states
