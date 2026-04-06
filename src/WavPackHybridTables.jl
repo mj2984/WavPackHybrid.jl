@@ -67,9 +67,8 @@ exp2_table = Vector{UInt8}([0x00, 0x01, 0x01, 0x02, 0x03, 0x03, 0x04, 0x05, 0x06
     0xd6, 0xd7, 0xd8, 0xd9, 0xdb, 0xdc, 0xdd, 0xde, 0xe0, 0xe1, 0xe2, 0xe4, 0xe5, 0xe6, 0xe8, 0xe9,
     0xea, 0xec, 0xed, 0xee, 0xf0, 0xf1, 0xf2, 0xf4, 0xf5, 0xf6, 0xf8, 0xf9, 0xfa, 0xfc, 0xfd, 0xff])
 
-decorrelationDType = Int32
 const WavpackDecorrelationTables = Dict{Symbol,Vector}(
-        :fast => Vector{Tuple{decorrelationDType,decorrelationDType,NTuple{2,decorrelationDType}}}([
+        :fast => Vector{Tuple{Bool,Int32,NTuple{2,Int}}}([
                 (1,2,(18,17)),
                 (1,1,(17,17)),
                 (0,2,(18,17)),
@@ -326,7 +325,7 @@ const WavpackDecorrelationTables = Dict{Symbol,Vector}(
                 (0,2,(18,17)),
                 (0,2,(18,17)),
                 ]),
-        :default => Vector{Tuple{decorrelationDType,decorrelationDType,NTuple{5,decorrelationDType}}}([
+        :default => Vector{Tuple{Bool,Int32,NTuple{5,Int}}}([
                 (1,2,(18,18, 2,17, 3)),
                 (0,2,(18,17,-1, 3, 2)),
                 (1,1,(17,18,18,-2, 2)),
@@ -584,7 +583,7 @@ const WavpackDecorrelationTables = Dict{Symbol,Vector}(
                 (0,2,(18,18,-2,18, 2)),
                 (0,2,(18,18,-2,18, 2)),
                 ]),
-        :high => Vector{Tuple{decorrelationDType,decorrelationDType,NTuple{10,decorrelationDType}}}([
+        :high => Vector{Tuple{Bool,Int32,NTuple{10,Int}}}([
                 (1,2,(18,18,18,-2, 2, 3, 5,-1,17, 4)),
                 (0,1,(18,17,-2, 2,18, 3, 7, 2, 5, 4)),
                 (1,2,( 1,18, 3, 6,-2,18, 2, 3, 4, 5)),
@@ -842,7 +841,7 @@ const WavpackDecorrelationTables = Dict{Symbol,Vector}(
                 (0,1,(-1,18,18, 2,18, 3, 5,18, 2, 8)),
                 (0,1,(-1,18,18, 2,18, 3, 5,18, 2, 8)),
                 ]),
-        :very_high => Vector{Tuple{decorrelationDType,decorrelationDType,NTuple{16,decorrelationDType}}}([
+        :very_high => Vector{Tuple{Bool,Int32,NTuple{16,Int}}}([
                 (1,2,(18,18, 2, 3,-2,18, 2, 4, 7, 5, 3, 6, 8,-1,18, 2)),
                 (0,1,(18,18,-1,18, 2, 3, 4, 6, 5, 7,18,-3, 8, 2,-1, 3)),
                 (1,2,( 1,18,-2, 4,18, 2, 3, 6,-1, 7, 5,-2,18, 8, 2, 4)),
