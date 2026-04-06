@@ -264,26 +264,23 @@ function trial_chain(data::Vector{Stereo{Int32}}, memories; init_weight::Int32 =
     return res
 end
 
+has_nonzero_samples(orig_samples) = any(s -> s.l != 0 || s.r != 0, orig_samples)
 function choose_stereo_mode!(
     wps,
     orig_samples::Vector{Stereo{Int32}},
     specs::Vector{DecorrSpec};
     num_passes::Int = 1,
     init_weight::Int32 = 0,
-    force_js::Bool = false,
-    force_ts::Bool = false,
 )
-
+    # Note:: force_joint_stereo, force_true_stereo options are removed from runtime. The equivalent can be achieved by directly altering specs before input.
+    # Note:: The zero checking logic is moved outside. Please run has_nonzero_samples on original samples before running this if you are unsure if the samples are valid.
+    #        return noisy, nothing, false
+    
     n = length(orig_samples)
 
     noisy = similar(orig_samples)
     stereo_add_noise!(wps, noisy, orig_samples)
     js_buf = stereo_to_midside(noisy)
-
-    all_zero = all(s -> s.l == 0 && s.r == 0, noisy)
-    if all_zero
-        return noisy, nothing, false
-    end
 
     best_size = typemax(UInt64)
     best_res  = Vector{Stereo{Int32}}(undef, n)
@@ -292,8 +289,7 @@ function choose_stereo_mode!(
 
     for pass in 1:num_passes
         for spec in specs
-            use_js = force_js || (spec.joint_stereo && !force_ts)
-            trial_in = use_js ? js_buf : noisy
+            trial_in = spec.joint_stereo ? js_buf : noisy
 
             N = length(spec.terms)
             deltas = ntuple(_ -> spec.delta, N)
@@ -306,7 +302,7 @@ function choose_stereo_mode!(
                 best_size = size
                 best_res  = res
                 best_mem  = memories
-                best_js   = use_js
+                best_js   = spec.joint_stereo
             end
         end
     end
