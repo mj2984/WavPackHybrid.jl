@@ -22,7 +22,7 @@ struct CrossPassState
     weight::Int32
 end
 
-@inline function process_pass!(::WavPackGenericStage{N},delta::Int32,st::IntraPassState,buf::MMatrix{2,N,T},s::Stereo{T}) where {N,T}
+@inline function process_pass!(::WavPackGenericStage{Delay},delta::Int32,st::IntraPassState,buf::MMatrix{2,Delay,T},s::Stereo{T}) where {Delay,T}
     L = s.l; R = s.r
 
     bi = st.idx
@@ -36,7 +36,7 @@ end
     resR = R - predR
 
     new_weight = update_weight(st.weight, delta, dL, resL)
-    new_idx    = (st.idx == N ? 1 : st.idx + 1)
+    new_idx    = (st.idx == Delay ? 1 : st.idx + 1)
 
     buf[1, bi] = L
     buf[2, bi] = R
@@ -146,10 +146,19 @@ function make_buffers(stages, ::Type{T}) where T
     end
     return bufs
 end
-@generated function process_chain!(stages::MT,delta::Int32,states::ST,bufs::BT,s::Stereo{T}) where {N,MT<:NTuple{N,Any},ST<:NTuple{N,Any},BT<:NTuple{N,Any},T}
+
+@generated function process_chain!(decor::WavPackDecorrelator{N,Stages,DeltaT},states::ST, bufs::BT, s::Stereo{T}) where {N,Stages,DeltaT,ST<:NTuple{N,Any},BT<:NTuple{N,Any},T}
     steps = Expr[]
-    for i in 1:N
-        push!(steps, :(s, st_$i = process_pass!(stages[$i], delta, states[$i], bufs[$i], s)))
+    if DeltaT === Int32
+        for i in 1:N
+            push!(steps, :(s, st_$i = process_pass!(decor.stages[$i], decor.delta,
+                                                   states[$i], bufs[$i], s)))
+        end
+    else
+        for i in 1:N
+            push!(steps, :(s, st_$i = process_pass!(decor.stages[$i], decor.delta[$i],
+                                                   states[$i], bufs[$i], s)))
+        end
     end
     new_states = Expr(:tuple, [Symbol("st_$i") for i in 1:N]...)
     quote
@@ -191,18 +200,10 @@ end
     return qv, corr
 end
 
-function hybrid_block(
-    data::AbstractVector{Stereo{Int32}},
-    memories;
-    init_weight::Int32 = 0,
-    qL::Int32,
-    qR::Int32,
-    shaping_delta_L::Int32,
-    shaping_delta_R::Int32,
-)
-
-    states = make_states(memories; init_weight)
-    bufs   = make_buffers(memories)
+function hybrid_block(data::Vector{Stereo{T}}, decorrelator::WavPackDecorrelator;init_weight=0, qL::T, qR::T, shaping_delta_L::T, shaping_delta_R::T) where {T}
+    stages, delta = decorrelator.stages, decorrelator.delta
+    states = make_states(stages; init_weight)
+    bufs   = make_buffers(stages, Int32)
 
     n = length(data)
     quantized       = Vector{Stereo{Int32}}(undef, n)
@@ -210,33 +211,21 @@ function hybrid_block(
     shaping_array_L = Vector{Int16}(undef, n)
     shaping_array_R = Vector{Int16}(undef, n)
 
-    errL = Int32(0)
-    errR = Int32(0)
-    shaping_acc_L = Int32(0)
-    shaping_acc_R = Int32(0)
+    errL, errR = Int32(0), Int32(0)
+    shaping_acc_L, shaping_acc_R = Int32(0), Int32(0)
 
     @inbounds for i in 1:n
         L = data[i].l
         R = data[i].r
-
-        L, errL, shaping_acc_L, wL = hybrid_shape_sample_lossy!(
-            L, errL, shaping_acc_L, shaping_delta_L
-        )
-        R, errR, shaping_acc_R, wR = hybrid_shape_sample_lossy!(
-            R, errR, shaping_acc_R, shaping_delta_R
-        )
-
+        L, errL, shaping_acc_L, wL = hybrid_shape_sample_lossy!(L, errL, shaping_acc_L, shaping_delta_L)
+        R, errR, shaping_acc_R, wR = hybrid_shape_sample_lossy!(R, errR, shaping_acc_R, shaping_delta_R)
         shaping_array_L[i] = wL
         shaping_array_R[i] = wR
-
-        res, states = process_chain!(memories, states, bufs, Stereo{Int32}(L, R))
-
+        res, states = process_chain!(decorrelator, states, bufs, Stereo{Int32}(L, R))
         qvL, corrL = quantize_residual(res.l, qL)
         qvR, corrR = quantize_residual(res.r, qR)
-
         quantized[i]  = Stereo{Int32}(qvL, qvR)
         correction[i] = Stereo{Int32}(corrL, corrR)
-
         errL = Int32(errL + qvL * qL)
         errR = Int32(errR + qvR * qR)
     end
