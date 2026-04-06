@@ -9,28 +9,17 @@
 #     dc.shaping_array::Union{Nothing,AbstractVector}
 #     wphdr.flags::UInt32
 
-############################################################
-# 1. Parameter structs (no magic constants)
-############################################################
-
 struct MedianParams
     div0::UInt32
     div1::UInt32
     div2::UInt32
 end
-
 const MEDIANS = MedianParams(128, 64, 32)
-
 struct SlowLevelParams
     shift::UInt32
     offset::UInt32
 end
-
 const SLOW = SlowLevelParams(8, 1 << 7)
-
-############################################################
-# 2. Entropy / words state
-############################################################
 
 mutable struct EntropyData
     median::NTuple{3,UInt32}   # (m0, m1, m2)
@@ -49,31 +38,16 @@ mutable struct WordsData
     c::NTuple{2,EntropyData}
 end
 
-############################################################
-# 3. Median helpers
-############################################################
-
 @inline get_med(m::UInt32) = (m >> 4) + 1
+@inline inc_med(m::UInt32, div::UInt32) = m + ((m + div) ÷ div) * 5
+@inline dec_med(m::UInt32, div::UInt32) = m - ((m + (div - 2)) ÷ div) * 2
 
-@inline inc_med(m::UInt32, div::UInt32) =
-    m + ((m + div) ÷ div) * 5
-
-@inline dec_med(m::UInt32, div::UInt32) =
-    m - ((m + (div - 2)) ÷ div) * 2
-
-############################################################
 # 4. update_error_limit! (stub for now)
-############################################################
-
 function update_error_limit!(wps)
     # TODO: port from C:
     #   void update_error_limit (WavpackStream *wps)
     return
 end
-
-############################################################
-# 5. nosend_word (bit-exact, Julian style)
-############################################################
 
 function nosend_word(wps, value::Int32, chan::Int)
     wd = wps.w::WordsData
@@ -147,10 +121,6 @@ function nosend_word(wps, value::Int32, chan::Int)
     return sign ? ~Int32(mid) : Int32(mid)
 end
 
-############################################################
-# 6. Decorrelation spec
-############################################################
-
 struct DecorrSpec{N}
     joint_stereo::Bool
     delta::Int32
@@ -167,10 +137,6 @@ function load_specs_from_tables(tables::Dict{Symbol,Vector}, key::Symbol)
     end
     return specs
 end
-
-############################################################
-# 7. wp_log2 (bit-exact)
-############################################################
 
 @inline function wp_log2(avalue::UInt32)
     av = avalue + (avalue >> 9)
@@ -194,9 +160,6 @@ end
     end
 end
 
-############################################################
-# 8. log2buffer (bit-exact)
-############################################################
 @inline function log2buffer(res::Vector{Stereo{Int32}}; log_limit::Int32 = 0)
     acc = Int64(0)
     @inbounds for s in res
@@ -216,9 +179,6 @@ end
     end
     return acc
 end
-############################################################
-# 9. Mid/side transform
-############################################################
 
 function to_joint_stereo(data::Vector{Stereo{Int32}})
     out = similar(data)
@@ -231,10 +191,6 @@ function to_joint_stereo(data::Vector{Stereo{Int32}})
     end
     return out
 end
-
-############################################################
-# 10. Noisy buffer (bit-exact stereo_add_noise, hybrid only)
-############################################################
 
 function stereo_add_noise!(wps, noisy::Vector{Stereo{Int32}},
                            orig::Vector{Stereo{Int32}})
@@ -314,10 +270,6 @@ function stereo_add_noise!(wps, noisy::Vector{Stereo{Int32}},
     return noisy
 end
 
-############################################################
-# 11. Single decorrelation trial
-############################################################
-
 function trial_chain(data::Vector{Stereo{Int32}}, memories; init_weight::Int32 = 0)
     states = make_states(memories; init_weight)
     bufs   = make_buffers(memories)
@@ -334,10 +286,6 @@ function trial_chain(data::Vector{Stereo{Int32}}, memories; init_weight::Int32 =
 
     return res
 end
-
-############################################################
-# 12. Stereo mode chooser (uses noisy buffer)
-############################################################
 
 function choose_stereo_mode!(
     wps,
