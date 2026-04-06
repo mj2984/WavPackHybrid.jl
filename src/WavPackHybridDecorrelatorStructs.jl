@@ -1,11 +1,3 @@
-###############################
-# WavPackHybridDecorrelator.jl
-###############################
-
-# ============================================================
-# Weight application and update (WavPack-accurate)
-# ============================================================
-
 @inline function apply_weight(weight::Int32, sample::Int32)
     return Int32((Int64(weight) * Int64(sample) + 512) >> 10)
 end
@@ -17,39 +9,23 @@ end
     end
     return weight
 end
-
-# ============================================================
-# Memory types
-# ============================================================
-
 struct IntraPassMemoryGeneric{N,T}
     delta::Int32
 end
-
 struct IntraPassMemorySpecial{term,T}
     delta::Int32
 end
-
 struct IntraPassMemoryCrossChannel{term}
     delta::Int32
 end
-
-# ============================================================
-# Predictor state types
-# ============================================================
 
 struct IntraPassState
     weight::Int32
     idx::Int
 end
-
 struct CrossPassState
     weight::Int32
 end
-
-# ============================================================
-# Intra-channel decorrelation (generic terms 1–8)
-# ============================================================
 
 @inline function process_pass!(
     mem::IntraPassMemoryGeneric{N,T},
@@ -79,10 +55,6 @@ end
 
     return Stereo{T}(resL, resR), IntraPassState(new_weight, new_idx)
 end
-
-# ============================================================
-# Intra-channel decorrelation (special terms 17 & 18)
-# ============================================================
 
 @inline function process_pass!(
     mem::IntraPassMemorySpecial{term,T},
@@ -128,10 +100,6 @@ end
     return Stereo{T}(resL, resR), IntraPassState(new_weight, new_idx)
 end
 
-# ============================================================
-# Cross-channel decorrelation (-1, -2, -3)
-# ============================================================
-
 @inline function process_pass!(
     mem::IntraPassMemoryCrossChannel{term},
     st::CrossPassState,
@@ -164,10 +132,6 @@ end
     end
 end
 
-# ============================================================
-# Memory + state constructors
-# ============================================================
-
 function make_memories(::Type{T}, terms, deltas) where {T}
     mems = ()
     for (term, delta) in zip(terms, deltas)
@@ -196,10 +160,6 @@ function make_states(memories; init_weight=0)
     return states
 end
 
-# ============================================================
-# Per-stage buffer constructor (tuple of MMatrices)
-# ============================================================
-
 function make_buffers(memories)
     bufs = ()
     for mem in memories
@@ -213,10 +173,6 @@ function make_buffers(memories)
     end
     return bufs
 end
-
-# ============================================================
-# Generated decorrelation chain
-# ============================================================
 
 @generated function process_chain!(
     memories::MT,
@@ -236,11 +192,6 @@ end
         return s, $new_states
     end
 end
-
-# ============================================================
-# Hybrid shaping (hybrid lossless only)
-# NEW_SHAPING always enabled
-# ============================================================
 
 @inline function hybrid_shape_sample_lossy!(
     sample::Int32,
@@ -267,10 +218,6 @@ end
     return sample, err, shaping_acc, Int16(shaping_weight)
 end
 
-# ============================================================
-# Quantization (WavPack-accurate)
-# ============================================================
-
 @inline function quantize_residual(res::Int32, q::Int32)
     half_q = q >>> 1
     qv = (res + half_q) ÷ q
@@ -278,10 +225,6 @@ end
     corr = Int32(res - dq)
     return qv, corr
 end
-
-# ============================================================
-# Full hybrid lossless block
-# ============================================================
 
 function hybrid_block(
     data::AbstractVector{Stereo{Int32}},
