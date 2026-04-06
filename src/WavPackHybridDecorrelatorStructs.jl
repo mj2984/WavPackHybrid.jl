@@ -9,15 +9,10 @@ end
     end
     return weight
 end
-struct IntraPassMemoryGeneric{N,T}
-    delta::Int32
-end
-struct IntraPassMemorySpecial{term,T}
-    delta::Int32
-end
-struct IntraPassMemoryCrossChannel{term}
-    delta::Int32
-end
+abstract type WavPackDecorrelatorStage end
+struct WavPackGenericStage{Delay} <: WavPackDecorrelatorStage end
+struct WavPackSpecialStage{Term} <: WavPackDecorrelatorStage end
+struct WavPackCrossChannelStage{Term} <: WavPackDecorrelatorStage end
 
 struct IntraPassState
     weight::Int32
@@ -27,15 +22,8 @@ struct CrossPassState
     weight::Int32
 end
 
-@inline function process_pass!(
-    mem::IntraPassMemoryGeneric{N,T},
-    st::IntraPassState,
-    buf::MMatrix{2,N,Int32},
-    s::Stereo{T},
-) where {N,T}
-
-    L = s.l
-    R = s.r
+@inline function process_pass!(::WavPackGenericStage{N},delta::Int32,st::IntraPassState,buf::MMatrix{2,N,T},s::Stereo{T}) where {N,T}
+    L = s.l; R = s.r
 
     bi = st.idx
     dL = buf[1, bi]
@@ -47,7 +35,7 @@ end
     resL = L - predL
     resR = R - predR
 
-    new_weight = update_weight(st.weight, mem.delta, dL, resL)
+    new_weight = update_weight(st.weight, delta, dL, resL)
     new_idx    = (st.idx == N ? 1 : st.idx + 1)
 
     buf[1, bi] = L
@@ -56,15 +44,8 @@ end
     return Stereo{T}(resL, resR), IntraPassState(new_weight, new_idx)
 end
 
-@inline function process_pass!(
-    mem::IntraPassMemorySpecial{term,T},
-    st::IntraPassState,
-    buf::MMatrix{2,2,Int32},
-    s::Stereo{T},
-) where {term,T}
-
-    L = s.l
-    R = s.r
+@inline function process_pass!(::WavPackSpecialStage{Term},delta::Int32,st::IntraPassState,buf::MMatrix{2,2,T},s::Stereo{T}) where {Term,T}
+    L = s.l; R = s.r
 
     i0 = st.idx
     i1 = (i0 == 1 ? 2 : 1)
@@ -72,10 +53,10 @@ end
     xL0 = buf[1, i0]; xL1 = buf[1, i1]
     xR0 = buf[2, i0]; xR1 = buf[2, i1]
 
-    if term == 17
+    if Term == 17
         samL = 2*xL0 - xL1
         samR = 2*xR0 - xR1
-    elseif term == 18
+    elseif Term == 18
         samL = xL0 + ((xL0 - xL1) >>> 1)
         samR = xR0 + ((xR0 - xR1) >>> 1)
     else
@@ -88,7 +69,7 @@ end
     resL = L - predL
     resR = R - predR
 
-    new_weight = update_weight(st.weight, mem.delta, samL, resL)
+    new_weight = update_weight(st.weight, delta, samL, resL)
 
     buf[1, i1] = xL0
     buf[2, i1] = xR0
@@ -100,59 +81,50 @@ end
     return Stereo{T}(resL, resR), IntraPassState(new_weight, new_idx)
 end
 
-@inline function process_pass!(
-    mem::IntraPassMemoryCrossChannel{term},
-    st::CrossPassState,
-    ::Nothing,
-    s::Stereo{T},
-) where {T,term}
-
+@inline function process_pass!(::WavPackCrossChannelStage{Term},delta::Int32,st::CrossPassState,::Nothing,s::Stereo{T}) where {Term,T}
     L = s.l; R = s.r
-
-    if term == -1
+    if Term == -1
         pred = (st.weight * L) >>> 10
         resR = R - pred
-        new_weight = update_weight(st.weight, mem.delta, L, resR)
+        new_weight = update_weight(st.weight, delta, L, resR)
         return Stereo{T}(L, resR), CrossPassState(new_weight)
-
-    elseif term == -2
+    elseif Term == -2
         pred = (st.weight * R) >>> 10
         resL = L - pred
-        new_weight = update_weight(st.weight, mem.delta, R, resL)
+        new_weight = update_weight(st.weight, delta, R, resL)
         return Stereo{T}(resL, R), CrossPassState(new_weight)
-
-    elseif term == -3
+    elseif Term == -3
         predL = (st.weight * R) >>> 10
         predR = (st.weight * L) >>> 10
         resL = L - predL
         resR = R - predR
         err = resL + resR
-        new_weight = update_weight(st.weight, mem.delta, err, err)
+        new_weight = update_weight(st.weight, delta, err, err)
         return Stereo{T}(resL, resR), CrossPassState(new_weight)
     end
 end
 
-@generated function make_memories(::Type{T}, terms::NTuple{N,Int}, delta) where {T,N}
+@generated function make_stages(terms::NTuple{N,Int}) where {N}
     exprs = Vector{Any}(undef, N)
     for i in 1:N
-        term = terms[i]  # compile-time constant
+        term = terms[i]
         exprs[i] = if 1 ≤ term ≤ 8
-            :(IntraPassMemoryGeneric{$term,T}(delta))
+            :(WavPackGenericStage{$term}())
         elseif term == 17
-            :(IntraPassMemorySpecial{17,T}(delta))
+            :(WavPackSpecialStage{17}())
         elseif term == 18
-            :(IntraPassMemorySpecial{18,T}(delta))
+            :(WavPackSpecialStage{18}())
         else
-            :(IntraPassMemoryCrossChannel{$term}(delta))
+            :(WavPackCrossChannelStage{$term}())
         end
     end
     return :(($(exprs...),))
 end
 
-function make_states(memories; init_weight=0)
+function make_states(stages; init_weight=0)
     states = ()
-    for mem in memories
-        if mem isa IntraPassMemoryGeneric || mem isa IntraPassMemorySpecial
+    for stage in stages
+        if stage isa WavPackGenericStage || stage isa WavPackSpecialStage
             states = (states..., IntraPassState(init_weight, 1))
         else
             states = (states..., CrossPassState(init_weight))
@@ -161,13 +133,13 @@ function make_states(memories; init_weight=0)
     return states
 end
 
-function make_buffers(memories)
+function make_buffers(stages, ::Type{T}) where T
     bufs = ()
-    for mem in memories
-        if mem isa IntraPassMemoryGeneric{N,T} where {N,T}
-            bufs = (bufs..., MMatrix{2,N,Int32}(zeros(Int32,2,N)))
-        elseif mem isa IntraPassMemorySpecial
-            bufs = (bufs..., MMatrix{2,2,Int32}(zeros(Int32,2,2)))
+    for stage in stages
+        if stage isa WavPackGenericStage{N} where N
+            bufs = (bufs..., MMatrix{2,N,T}(zeros(T, 2, N)))
+        elseif stage isa WavPackSpecialStage
+            bufs = (bufs..., MMatrix{2,2,T}(zeros(T, 2, 2)))
         else
             bufs = (bufs..., nothing)
         end
