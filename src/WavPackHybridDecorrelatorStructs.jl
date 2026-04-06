@@ -146,20 +146,12 @@ function make_buffers(stages, ::Type{T}) where T
     end
     return bufs
 end
-
-@generated function process_chain!(
-    memories::MT,
-    states::ST,
-    bufs::BT,
-    s::Stereo{T},
-) where {N,MT<:NTuple{N,Any},ST<:NTuple{N,Any},BT<:NTuple{N,Any},T}
-
-    steps = []
+@generated function process_chain!(stages::MT,delta::Int32,states::ST,bufs::BT,s::Stereo{T}) where {N,MT<:NTuple{N,Any},ST<:NTuple{N,Any},BT<:NTuple{N,Any},T}
+    steps = Expr[]
     for i in 1:N
-        push!(steps, :(s, st_$i = process_pass!(memories[$i], states[$i], bufs[$i], s)))
+        push!(steps, :(s, st_$i = process_pass!(stages[$i], delta, states[$i], bufs[$i], s)))
     end
     new_states = Expr(:tuple, [Symbol("st_$i") for i in 1:N]...)
-
     quote
         $(Expr(:block, steps...))
         return s, $new_states
