@@ -121,7 +121,7 @@ function nosend_word(wps, value::Int32, chan::Int)
     return sign ? ~Int32(mid) : Int32(mid)
 end
 
-struct WavPackDecorrelator{N,Stages,DeltaT}
+struct WavPackDecorrelator{N,Stages<:NTuple{N,WavPackDecorrelatorStage},DeltaT<:Union{Int32,NTuple{N,Int32}}}
     midside::Bool
     delta::DeltaT
     stages::Stages
@@ -132,7 +132,7 @@ function load_decorrelators(tables, key)
     for i in eachindex(raw)
         midside, delta, terms = raw[i]
         stages = make_stages(terms)
-        decs[i] = WavPackDecorrelator{length(terms),typeof(stages),typeof(delta)}(midside != 0, delta, stages)
+        decs[i] = WavPackDecorrelator(midside != 0, delta, stages)
     end
     return decs
 end
@@ -246,49 +246,47 @@ function stereo_add_noise!(wps, noisy::Vector{Stereo{Int32}},
     return noisy
 end
 
-function trial_chain(data::Vector{Stereo{Int32}}, decor::WavPackDecorrelator; init_weight=0)
-    stages = decor.stages
-    delta  = decor.delta
+function trial_chain!(res_buffer::Vector{Stereo{Int32}},data::Vector{Stereo{Int32}},decorrelator::WavPackDecorrelator;init_weight=0)
+    stages = decorrelator.stages
     states = make_states(stages; init_weight)
     bufs   = make_buffers(stages, Int32)
-    res = Vector{Stereo{Int32}}(undef, length(data))
-    s = Stereo{Int32}(0, 0)
     @inbounds for i in eachindex(data)
-        s = data[i]
-        s, states = process_chain!(decor, states, bufs, s)
-        res[i] = s
+        s, states = process_chain!(decorrelator, states, bufs, data[i])
+        res_buffer[i] = s
     end
-    return res
+    return res_buffer
 end
 
 has_nonzero_samples(orig_samples) = any(s -> s.l != 0 || s.r != 0, orig_samples)
-function choose_stereo_mode!(wps, orig_samples::Vector{Stereo{T}}, decorrelators::Vector{WavPackDecorrelator}; num_passes=1, init_weight=0) where {T}
-    # Note:: force_joint_stereo, force_true_stereo options are removed from runtime. The equivalent can be achieved by directly altering specs before input.
-    # Note:: The zero checking logic is moved outside. Please run has_nonzero_samples on original samples before running this if you are unsure if the samples are valid.
-    #        return noisy, nothing, false
-    
+# Note:: force_joint_stereo, force_true_stereo options are removed from runtime. The equivalent can be achieved by directly altering specs before input.
+# Note:: The zero checking logic is moved outside. Please run has_nonzero_samples on original samples before running this if you are unsure if the samples are valid.
+#        return noisy, nothing, false
+function choose_stereo_mode!(wps,orig_samples::Vector{Stereo{T}},decorrelators::Vector{WavPackDecorrelator};num_passes=1,init_weight=0) where {T}
     n = length(orig_samples)
-
     noisy = similar(orig_samples)
     stereo_add_noise!(wps, noisy, orig_samples)
     js_buf = stereo_to_midside(noisy)
-
-    best_size = typemax(UInt64)
-    best_res  = Vector{Stereo{Int32}}(undef, n)
-    best_mem  = nothing
-    best_js   = false
-
+    # Two reusable buffers
+    bufA = Vector{Stereo{Int32}}(undef, n)
+    bufB = Vector{Stereo{Int32}}(undef, n)
+    best_size  = typemax(UInt64)
+    best_res   = bufA
+    best_decor = nothing
+    best_js    = false
     for pass in 1:num_passes
-        for decorrelator in decorrelators
-            trial_in = decorrelator.midside ? js_buf : noisy
-            res = trial_chain(trial_in, decorrelator; init_weight)
-            size = UInt64(log2buffer(res))
+        for decor in decorrelators
+            trial_in = decor.midside ? js_buf : noisy
+            # Swap buffers each iteration
+            buf = (best_res === bufA) ? bufB : bufA
+            trial_chain!(buf, trial_in, decor; init_weight)
+            size = UInt64(log2buffer(buf))
             if size < best_size
-                best_size = size
-                best_res  = res
+                best_size  = size
+                best_res   = buf
                 best_decor = decor
+                best_js    = decor.midside
             end
         end
     end
-    return best_res, best_mem, best_js
+    return best_res, best_decor, best_js
 end
