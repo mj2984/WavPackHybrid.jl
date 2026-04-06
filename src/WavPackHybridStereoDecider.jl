@@ -194,9 +194,6 @@ end
 
 function stereo_add_noise!(wps, noisy::Vector{Stereo{Int32}},
                            orig::Vector{Stereo{Int32}})
-    flags = wps.wphdr.flags
-    is_new = (flags & NEW_SHAPING) != 0
-
     shaping_array = wps.dc.shaping_array
 
     error0 = Int32(0)
@@ -224,7 +221,7 @@ function stereo_add_noise!(wps, noisy::Vector{Stereo{Int32}},
         q0    = nosend_word(wps, s.l, 0)
         base_err0 = q0 - s.l
 
-        if is_new && shaping_weight0 < 0 && temp0 != 0
+        if shaping_weight0 < 0 && temp0 != 0
             if temp0 == error0
                 temp0 += temp0 < 0 ? 1 : -1
             end
@@ -242,7 +239,7 @@ function stereo_add_noise!(wps, noisy::Vector{Stereo{Int32}},
         q1    = nosend_word(wps, s.r, 1)
         base_err1 = q1 - s.r
 
-        if is_new && shaping_weight1 < 0 && temp1 != 0
+        if shaping_weight1 < 0 && temp1 != 0
             if temp1 == error1
                 temp1 += temp1 < 0 ? 1 : -1
             end
