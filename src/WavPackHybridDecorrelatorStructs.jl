@@ -132,20 +132,23 @@ end
     end
 end
 
-function make_memories(::Type{T}, terms, delta) where {T}
-    mems = ()
-    for term in terms
-        if 1 ≤ term ≤ 8
-            mems = (mems..., IntraPassMemoryGeneric{term,T}(delta))
-        elseif term == 17
-            mems = (mems..., IntraPassMemorySpecial{17,T}(delta))
-        elseif term == 18
-            mems = (mems..., IntraPassMemorySpecial{18,T}(delta))
-        else
-            mems = (mems..., IntraPassMemoryCrossChannel{term}(delta))
-        end
+@generated function make_memories(::Type{T}, terms::NTuple{N,Int}, delta) where {T,N}
+    exprs = []
+    for i in 1:N
+        push!(exprs, :(begin
+            term = terms[$i]
+            if 1 ≤ term ≤ 8
+                IntraPassMemoryGeneric{term,T}(delta)
+            elseif term == 17
+                IntraPassMemorySpecial{17,T}(delta)
+            elseif term == 18
+                IntraPassMemorySpecial{18,T}(delta)
+            else
+                IntraPassMemoryCrossChannel{term}(delta)
+            end
+        end))
     end
-    return mems
+    return :(($(exprs...),))
 end
 
 function make_states(memories; init_weight=0)
