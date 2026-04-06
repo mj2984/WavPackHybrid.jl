@@ -290,14 +290,9 @@ function choose_stereo_mode!(
     for pass in 1:num_passes
         for spec in specs
             trial_in = spec.joint_stereo ? js_buf : noisy
-
-            N = length(spec.terms)
-            deltas = ntuple(_ -> spec.delta, N)
-            memories = make_memories(Int32, spec.terms, deltas)
+            memories = make_memories(Int32, spec.terms, spec.delta)
             res = trial_chain(trial_in, memories; init_weight)
-
             size = UInt64(log2buffer(res))
-
             if size < best_size
                 best_size = size
                 best_res  = res
@@ -306,6 +301,5 @@ function choose_stereo_mode!(
             end
         end
     end
-
     return best_res, best_mem, best_js
 end
