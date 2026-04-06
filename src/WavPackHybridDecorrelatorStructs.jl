@@ -132,9 +132,9 @@ end
     end
 end
 
-function make_memories(::Type{T}, terms, deltas) where {T}
+function make_memories(::Type{T}, terms, delta) where {T}
     mems = ()
-    for (term, delta) in zip(terms, deltas)
+    for term in terms
         if 1 ≤ term ≤ 8
             mems = (mems..., IntraPassMemoryGeneric{term,T}(delta))
         elseif term == 17
