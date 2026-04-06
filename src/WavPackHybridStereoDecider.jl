@@ -121,9 +121,9 @@ function nosend_word(wps, value::Int32, chan::Int)
     return sign ? ~Int32(mid) : Int32(mid)
 end
 
-struct WavPackDecorrelator{N,Stages<:NTuple{N,WavPackDecorrelatorStage}}
+struct WavPackDecorrelator{N,Stages,DeltaT}
     midside::Bool
-    delta::Union{Int32,NTuple{N,Int32}}
+    delta::DeltaT
     stages::Stages
 end
 function load_decorrelators(tables, key)
@@ -132,7 +132,7 @@ function load_decorrelators(tables, key)
     for i in eachindex(raw)
         midside, delta, terms = raw[i]
         stages = make_stages(terms)
-        decs[i] = WavPackDecorrelator(midside, delta, stages)
+        decs[i] = WavPackDecorrelator{length(terms),typeof(stages),typeof(delta)}(midside != 0, delta, stages)
     end
     return decs
 end
@@ -246,31 +246,23 @@ function stereo_add_noise!(wps, noisy::Vector{Stereo{Int32}},
     return noisy
 end
 
-function trial_chain(data::Vector{Stereo{Int32}}, memories; init_weight::Int32 = 0)
-    states = make_states(memories; init_weight)
-    bufs   = make_buffers(memories)
-
-    n = length(data)
-    res = Vector{Stereo{Int32}}(undef, n)
-
+function trial_chain(data::Vector{Stereo{Int32}}, decor::WavPackDecorrelator; init_weight=0)
+    stages = decor.stages
+    delta  = decor.delta
+    states = make_states(stages; init_weight)
+    bufs   = make_buffers(stages, Int32)
+    res = Vector{Stereo{Int32}}(undef, length(data))
     s = Stereo{Int32}(0, 0)
-    @inbounds for i in 1:n
+    @inbounds for i in eachindex(data)
         s = data[i]
-        s, states = process_chain!(memories, states, bufs, s)
+        s, states = process_chain!(decor, states, bufs, s)
         res[i] = s
     end
-
     return res
 end
 
 has_nonzero_samples(orig_samples) = any(s -> s.l != 0 || s.r != 0, orig_samples)
-function choose_stereo_mode!(
-    wps,
-    orig_samples::Vector{Stereo{Int32}},
-    specs::Vector{DecorrSpec};
-    num_passes::Int = 1,
-    init_weight::Int32 = 0,
-)
+function choose_stereo_mode!(wps, orig_samples::Vector{Stereo{T}}, decorrelators::Vector{WavPackDecorrelator}; num_passes=1, init_weight=0) where {T}
     # Note:: force_joint_stereo, force_true_stereo options are removed from runtime. The equivalent can be achieved by directly altering specs before input.
     # Note:: The zero checking logic is moved outside. Please run has_nonzero_samples on original samples before running this if you are unsure if the samples are valid.
     #        return noisy, nothing, false
@@ -287,16 +279,14 @@ function choose_stereo_mode!(
     best_js   = false
 
     for pass in 1:num_passes
-        for spec in specs
-            trial_in = spec.joint_stereo ? js_buf : noisy
-            memories = make_memories(Int32, spec.terms, spec.delta)
-            res = trial_chain(trial_in, memories; init_weight)
+        for decorrelator in decorrelators
+            trial_in = decorrelator.midside ? js_buf : noisy
+            res = trial_chain(trial_in, decorrelator; init_weight)
             size = UInt64(log2buffer(res))
             if size < best_size
                 best_size = size
                 best_res  = res
-                best_mem  = memories
-                best_js   = spec.joint_stereo
+                best_decor = decor
             end
         end
     end
