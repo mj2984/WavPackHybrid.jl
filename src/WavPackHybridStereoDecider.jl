@@ -121,21 +121,20 @@ function nosend_word(wps, value::Int32, chan::Int)
     return sign ? ~Int32(mid) : Int32(mid)
 end
 
-struct DecorrSpec{N}
-    joint_stereo::Bool
-    delta::Int32
-    terms::NTuple{N,Int}
+struct WavPackDecorrelator{N,Stages<:NTuple{N,WavPackDecorrelatorStage}}
+    midside::Bool
+    delta::Union{Int32,NTuple{N,Int32}}
+    stages::Stages
 end
-
-function load_specs_from_tables(tables::Dict{Symbol,Vector}, key::Symbol)
+function load_decorrelators(tables, key)
     raw = tables[key]
-    specs = DecorrSpec[]
-    for (joint, delta, terms) in raw
-        N = length(terms)
-        tnt = ntuple(i -> Int(terms[i]), N)
-        push!(specs, DecorrSpec{N}(joint != 0, Int32(delta), tnt))
+    decs = Vector{WavPackDecorrelator}(undef, length(raw))
+    for i in eachindex(raw)
+        midside, delta, terms = raw[i]
+        stages = make_stages(terms)
+        decs[i] = WavPackDecorrelator(midside, delta, stages)
     end
-    return specs
+    return decs
 end
 
 @inline function wp_log2(avalue::UInt32)
