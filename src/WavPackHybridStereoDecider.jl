@@ -192,77 +192,62 @@ function to_joint_stereo(data::Vector{Stereo{Int32}})
     return out
 end
 
+@inline function hybrid_shape_sample_nosend!(
+    wps,
+    sample::Int32,
+    error::Int32,
+    acc::Int32,
+    δ::Int32,
+    chan::Int
+)
+    acc += δ
+    shaping_weight = acc >> 16
+    
+    temp = -apply_weight(shaping_weight, error)
+    
+    # nosend_word provides the quantized/processed reference
+    q = nosend_word(wps, sample, chan)
+    base_err = q - sample
+
+    if shaping_weight < 0 && temp != 0
+        if temp == error
+            temp += temp < 0 ? Int32(1) : Int32(-1)
+        end
+    end
+    
+    new_error = base_err + temp
+    new_sample = sample + new_error
+
+    return new_sample, new_error, acc
+end
+
 function stereo_add_noise!(wps, noisy::Vector{Stereo{Int32}},
                            orig::Vector{Stereo{Int32}})
-    shaping_array = wps.dc.shaping_array
+    # This refactor assumes the case where shaping_array === nothing
+    acc0, acc1 = wps.dc.shaping_acc
+    δ0, δ1     = wps.dc.shaping_delta
+    error0, error1 = Int32(0), Int32(0)
 
-    error0 = Int32(0)
-    error1 = Int32(0)
-
-    cnt = length(orig)
-
-    # hybrid lossless only: always use shaping path
-    acc0 = wps.dc.shaping_acc[1]
-    acc1 = wps.dc.shaping_acc[2]
-    δ0   = wps.dc.shaping_delta[1]
-    δ1   = wps.dc.shaping_delta[2]
-
-    idx_sa = 1
-
-    @inbounds for i in 1:cnt
+    @inbounds for i in 1:length(orig)
         s = orig[i]
 
-        # ----- channel 0 -----
-        shaping_weight0 = shaping_array !== nothing ?
-            Int32(shaping_array[idx_sa]) :
-            begin acc0 += δ0; acc0 >> 16 end
+        # Process Left Channel (0)
+        noisyL, error0, acc0 = hybrid_shape_sample_nosend!(
+            wps, s.l, error0, acc0, δ0, 0
+        )
 
-        temp0 = -apply_weight(shaping_weight0, error0)
-        q0    = nosend_word(wps, s.l, 0)
-        base_err0 = q0 - s.l
-
-        if shaping_weight0 < 0 && temp0 != 0
-            if temp0 == error0
-                temp0 += temp0 < 0 ? 1 : -1
-            end
-            error0 = base_err0 + temp0
-        else
-            error0 = base_err0 + temp0
-        end
-
-        noisyL = s.l + error0
-
-        # ----- channel 1 -----
-        shaping_weight1 = begin acc1 += δ1; acc1 >> 16 end
-
-        temp1 = -apply_weight(shaping_weight1, error1)
-        q1    = nosend_word(wps, s.r, 1)
-        base_err1 = q1 - s.r
-
-        if shaping_weight1 < 0 && temp1 != 0
-            if temp1 == error1
-                temp1 += temp1 < 0 ? 1 : -1
-            end
-            error1 = base_err1 + temp1
-        else
-            error1 = base_err1 + temp1
-        end
-
-        noisyR = s.r + error1
+        # Process Right Channel (1)
+        noisyR, error1, acc1 = hybrid_shape_sample_nosend!(
+            wps, s.r, error1, acc1, δ1, 1
+        )
 
         noisy[i] = Stereo{Int32}(noisyL, noisyR)
-
-        if shaping_array !== nothing
-            idx_sa += 1
-        end
     end
 
-    if shaping_array === nothing
-        acc0 -= δ0 * cnt
-        acc1 -= δ1 * cnt
-    end
-
-    wps.dc.shaping_acc = (acc0, acc1)
+    # Subtract the total change (delta * number of samples) to match WavPack's 
+    # block-level state management and prevent drift.
+    cnt = length(orig)
+    wps.dc.shaping_acc = (acc0 - δ0 * cnt, acc1 - δ1 * cnt)
 
     return noisy
 end
