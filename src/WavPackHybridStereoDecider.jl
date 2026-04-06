@@ -266,27 +266,24 @@ function choose_stereo_mode!(wps,orig_samples::Vector{Stereo{T}},decorrelators::
     noisy = similar(orig_samples)
     stereo_add_noise!(wps, noisy, orig_samples)
     js_buf = stereo_to_midside(noisy)
-    # Two reusable buffers
-    bufA = Vector{Stereo{Int32}}(undef, n)
-    bufB = Vector{Stereo{Int32}}(undef, n)
-    best_size  = typemax(UInt64)
-    best_res   = bufA
+    num_threads = 1  # later: Threads.nthreads()
+    bufs = [Vector{Stereo{Int32}}(undef, n) for _ in 1:(num_threads + 1)]
+    best_idx = 1
+    best_size = typemax(UInt64)
     best_decor = nothing
-    best_js    = false
     for pass in 1:num_passes
         for decor in decorrelators
+            # pick ANY buffer that is not the best buffer
+            buf_idx = (best_idx == 1) ? 2 : 1 # (for now, num_threads=1, so this picks the other one)
+            buf = bufs[buf_idx]
             trial_in = decor.midside ? js_buf : noisy
-            # Swap buffers each iteration
-            buf = (best_res === bufA) ? bufB : bufA
             trial_chain!(buf, trial_in, decor; init_weight)
             size = UInt64(log2buffer(buf))
             if size < best_size
-                best_size  = size
-                best_res   = buf
+                best_size = size
+                best_idx = buf_idx
                 best_decor = decor
-                best_js    = decor.midside
             end
         end
     end
-    return best_res, best_decor, best_js
-end
+return bufs[best_idx], best_decor
