@@ -278,6 +278,7 @@ function choose_stereo_mode!(
 
     noisy = similar(orig_samples)
     stereo_add_noise!(wps, noisy, orig_samples)
+    js_buf = stereo_to_midside(noisy)
 
     all_zero = all(s -> s.l == 0 && s.r == 0, noisy)
     if all_zero
@@ -289,18 +290,10 @@ function choose_stereo_mode!(
     best_mem  = nothing
     best_js   = false
 
-    js_buf = nothing
-
     for pass in 1:num_passes
         for spec in specs
             use_js = force_js || (spec.joint_stereo && !force_ts)
-
-            trial_in = if use_js
-                js_buf === nothing && (js_buf = stereo_to_midside(noisy))
-                js_buf
-            else
-                noisy
-            end
+            trial_in = use_js ? js_buf : noisy
 
             N = length(spec.terms)
             deltas = ntuple(_ -> spec.delta, N)
