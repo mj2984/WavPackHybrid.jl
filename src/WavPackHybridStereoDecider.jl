@@ -268,7 +268,7 @@ has_nonzero_samples(orig_samples) = any(s -> s.l != 0 || s.r != 0, orig_samples)
 function choose_stereo_mode!(
     wps,
     orig_samples::Vector{Stereo{Int32}},
-    specs::Vector{DecorrSpec};
+    memories::Vector{DecorrSpec};
     num_passes::Int = 1,
     init_weight::Int32 = 0,
 )
