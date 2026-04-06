@@ -133,20 +133,18 @@ end
 end
 
 @generated function make_memories(::Type{T}, terms::NTuple{N,Int}, delta) where {T,N}
-    exprs = []
+    exprs = Vector{Any}(undef, N)
     for i in 1:N
-        push!(exprs, :(begin
-            term = terms[$i]
-            if 1 ≤ term ≤ 8
-                IntraPassMemoryGeneric{term,T}(delta)
-            elseif term == 17
-                IntraPassMemorySpecial{17,T}(delta)
-            elseif term == 18
-                IntraPassMemorySpecial{18,T}(delta)
-            else
-                IntraPassMemoryCrossChannel{term}(delta)
-            end
-        end))
+        term = terms[i]  # compile-time constant
+        exprs[i] = if 1 ≤ term ≤ 8
+            :(IntraPassMemoryGeneric{$term,T}(delta))
+        elseif term == 17
+            :(IntraPassMemorySpecial{17,T}(delta))
+        elseif term == 18
+            :(IntraPassMemorySpecial{18,T}(delta))
+        else
+            :(IntraPassMemoryCrossChannel{$term}(delta))
+        end
     end
     return :(($(exprs...),))
 end
