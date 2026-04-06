@@ -180,17 +180,12 @@ end
     return acc
 end
 
-function to_joint_stereo(data::Vector{Stereo{Int32}})
-    out = similar(data)
-    @inbounds for i in eachindex(data)
-        L = data[i].l
-        R = data[i].r
-        mid  = Int32(L - R)
-        side = Int32(R + (mid >>> 1))
-        out[i] = Stereo{Int32}(mid, side)
-    end
-    return out
+@inline function stereo_to_midside(input::Stereo{Int32})
+    mid::Int32 = input.l - input.r
+    side::Int32 = input.r + (mid >>> 1)
+    return Stereo{Int32}(mid,side)
 end
+stereo_to_midside(data::Vector{Stereo{Int32}}) = @inbounds map(stereo_to_midside,data)
 
 @inline function hybrid_shape_sample_nosend!(
     wps,
@@ -301,7 +296,7 @@ function choose_stereo_mode!(
             use_js = force_js || (spec.joint_stereo && !force_ts)
 
             trial_in = if use_js
-                js_buf === nothing && (js_buf = to_joint_stereo(noisy))
+                js_buf === nothing && (js_buf = stereo_to_midside(noisy))
                 js_buf
             else
                 noisy
